@@ -1,0 +1,47 @@
+# Slack App Manifest for ManageLM
+# Import this at https://api.slack.com/apps > Create New App > From a manifest
+#
+# After creating, replace <YOUR_HOST> with your actual plugin host URL.
+# For Socket Mode development, the URLs don't matter — just enable Socket Mode.
+
+display_information:
+  name: ManageLM
+  description: Manage Linux servers — get alerts, run tasks, and approve agents from Slack.
+  long_description: |
+    ManageLM brings your Linux server management into Slack. Receive real-time
+    notifications when agents come online or go offline, when tasks complete or
+    fail, and approve new servers — all without leaving your workspace.
+
+    Features:
+    - Real-time alerts for agent and task events
+    - /managelm slash command for status, approve, and running tasks
+    - Interactive buttons to approve agents and view task details
+    - Channel routing for alerts vs informational events
+
+    Requires a ManageLM account and API key. Learn more at https://www.managelm.com
+  background_color: "#1a1a2e"
+
+features:
+  bot_user:
+    display_name: ManageLM
+    always_online: true
+  slash_commands:
+    - command: /managelm
+      description: Manage Linux servers with ManageLM
+      usage_hint: "status | approve <host> | run <host> <skill> <task> | help"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - commands
+
+settings:
+  interactivity:
+    is_enabled: true
+    # Replace <YOUR_HOST> with your plugin's public URL
+    request_url: https://<YOUR_HOST>:3100/slack/events
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
