@@ -10,7 +10,7 @@ agent status, approve pending servers, or run tasks on any managed host.
 
 ## Features
 
-- **Real-time notifications** — agent enrollment, online/offline, task completed/failed
+- **Real-time notifications** — agent enrollment, online/offline, task completed/failed/needs_input
 - **Slash commands** — `/managelm status`, `approve`, `run`, `help`
 - **Interactive buttons** — approve agents and view task details inline
 - **Channel routing** — send alerts to `#ops-alerts` and info to `#ops-general`
