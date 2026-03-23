@@ -149,6 +149,18 @@ async function handleRun(args: string[], respond: Respond): Promise<void> {
   try {
     const result = await mlm.runTask(agent.id, skill, instruction);
     const task = result.task;
+
+    // Interactive task — agent needs user input
+    if (task.status === 'needs_input') {
+      const question = task.question || 'The agent needs more information.';
+      await respond({
+        response_type: 'in_channel',
+        replace_original: false,
+        text: `:question: *Input needed* on \`${agent.hostname}\`\n*Skill:* ${skill}\n*Question:* ${question}\n_Answer in the portal or via API: \`POST /api/tasks/${task.id}/answer\`_`,
+      });
+      return;
+    }
+
     const status = task.status === 'completed' ? ':white_check_mark:' : ':x:';
     const summary = task.summary || task.error_message || 'No output';
 
@@ -229,12 +241,16 @@ export function registerActions(app: App): void {
 
     try {
       const task = await mlm.getTask(taskId);
-      const status = task.status === 'completed' ? ':white_check_mark:' : ':x:';
+      const statusIcons: Record<string, string> = {
+        completed: ':white_check_mark:', failed: ':x:', needs_input: ':question:', answered: ':speech_balloon:',
+      };
+      const status = statusIcons[task.status] || ':grey_question:';
 
       const fields: string[] = [
         `*Status:* ${task.status}`,
         `*Skill:* ${task.skill_slug}`,
       ];
+      if (task.question) fields.push(`*Question:* ${task.question}`);
       if (task.summary) fields.push(`*Summary:* ${task.summary}`);
       if (task.error_message) fields.push(`*Error:* ${task.error_message}`);
       if (task.mutating) fields.push(':warning: _This task made changes_');

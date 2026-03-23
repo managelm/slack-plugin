@@ -27,9 +27,11 @@ function statusEmoji(status: string): string {
     case 'online':    return ':large_green_circle:';
     case 'offline':   return ':red_circle:';
     case 'pending':   return ':yellow_circle:';
-    case 'completed': return ':white_check_mark:';
-    case 'failed':    return ':x:';
-    default:          return ':grey_question:';
+    case 'completed':   return ':white_check_mark:';
+    case 'failed':      return ':x:';
+    case 'needs_input': return ':question:';
+    case 'answered':    return ':speech_balloon:';
+    default:            return ':grey_question:';
   }
 }
 
@@ -202,15 +204,43 @@ function taskFailed(data: Record<string, unknown>, ts: string): FormattedMessage
   };
 }
 
+function taskNeedsInput(data: Record<string, unknown>, ts: string): FormattedMessage {
+  const label = agentLabel(data);
+  const taskId = data.task_id as string;
+  const skill = (data.skill_slug || 'unknown') as string;
+  const question = (data.question || 'The agent needs more information.') as string;
+
+  return {
+    text: `Task on ${label} needs input: ${question}`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `${statusEmoji('needs_input')} *Task Needs Input* on ${label}\n*Skill:* ${skill}\n*Question:* ${question}\n${timestamp(ts)}`,
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
+          button('View Details', 'view_task', taskId),
+          linkButton('Answer in Portal', `${config.portalPublicUrl}/logs`),
+        ],
+      },
+    ],
+  };
+}
+
 // ─── Router ──────────────────────────────────────────────────────────
 
 const formatters: Record<string, (data: Record<string, unknown>, ts: string) => FormattedMessage> = {
-  'agent.enrolled':  agentEnrolled,
-  'agent.approved':  agentApproved,
-  'agent.online':    agentOnline,
-  'agent.offline':   agentOffline,
-  'task.completed':  taskCompleted,
-  'task.failed':     taskFailed,
+  'agent.enrolled':    agentEnrolled,
+  'agent.approved':    agentApproved,
+  'agent.online':      agentOnline,
+  'agent.offline':     agentOffline,
+  'task.completed':    taskCompleted,
+  'task.failed':       taskFailed,
+  'task.needs_input':  taskNeedsInput,
 };
 
 /**

@@ -27,9 +27,10 @@ export interface Task {
   agent_id: string;
   skill_slug: string;
   operation: string;
-  status: 'sent' | 'running' | 'completed' | 'failed' | 'timeout';
+  status: 'sent' | 'running' | 'completed' | 'failed' | 'timeout' | 'needs_input' | 'answered';
   error_message: string | null;
   summary: string | null;
+  question: string | null;
   mutating: boolean;
   created_at: string;
   completed_at: string | null;
