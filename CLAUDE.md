@@ -19,3 +19,8 @@
 - The plugin uses @slack/bolt for Slack integration and calls the ManageLM portal API.
 - All webhook payloads must be HMAC-verified before processing.
 - Never post secrets, API keys, or raw credentials to Slack channels.
+
+## Versioning
+
+- Version is in `package.json`. Bump it before deploying a new release.
+- No separate changelog file — release notes go in the GitHub release description.
