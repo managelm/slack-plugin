@@ -117,40 +117,50 @@ function webhookHandler(req: IncomingMessage, res: ServerResponse): void {
     chunks.push(chunk);
   });
 
-  req.on('end', async () => {
-    if (size > MAX_BODY) {
-      res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Payload too large' }));
-      return;
-    }
-    const body = Buffer.concat(chunks).toString('utf-8');
-    try {
-      const signature = req.headers['x-webhook-signature'] as string | undefined;
-      if (!verifyHmac(body, signature, webhookSecret)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid signature' }));
-        return;
+  // Wrap async processing to catch unhandled rejections
+  req.on('end', () => {
+    processWebhookBody(req, res, chunks, size > MAX_BODY).catch((err) => {
+      console.error('[webhook] Unhandled error in webhook processing:', err);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Internal error' }));
       }
-
-      const payload = JSON.parse(body) as WebhookPayload;
-      if (!payload.event || !payload.data) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing event or data fields' }));
-        return;
-      }
-      console.log(`[webhook] Received event: ${payload.event}`);
-
-      const fallbackChannel = config.channelAlerts || config.channelInfo || '';
-      await postEventToSlack(payload, fallbackChannel);
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-    } catch (err) {
-      console.error('[webhook] Error processing webhook:', err);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Internal error' }));
-    }
+    });
   });
+}
+
+/** Process the collected webhook body chunks. Extracted to an async function
+ *  so unhandled rejections are properly caught by the caller. */
+async function processWebhookBody(
+  req: IncomingMessage, res: ServerResponse, chunks: Buffer[], oversized: boolean,
+): Promise<void> {
+  if (oversized) {
+    res.writeHead(413, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Payload too large' }));
+    return;
+  }
+  const body = Buffer.concat(chunks).toString('utf-8');
+
+  const signature = req.headers['x-webhook-signature'] as string | undefined;
+  if (!verifyHmac(body, signature, webhookSecret)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Invalid signature' }));
+    return;
+  }
+
+  const payload = JSON.parse(body) as WebhookPayload;
+  if (!payload.event || !payload.data) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Missing event or data fields' }));
+    return;
+  }
+  console.log(`[webhook] Received event: ${payload.event}`);
+
+  const fallbackChannel = config.channelAlerts || config.channelInfo || '';
+  await postEventToSlack(payload, fallbackChannel);
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
 }
 
 /** GET /health — Health check. */

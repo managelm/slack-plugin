@@ -17,7 +17,7 @@
  */
 
 import type { App, SlackCommandMiddlewareArgs, BlockAction, ButtonAction } from '@slack/bolt';
-import type { ViewSubmitAction } from '@slack/bolt';
+import type { WebClient } from '@slack/web-api';
 import * as mlm from './managelm.js';
 import { config } from './config.js';
 import { STATUS_ICONS } from './formatters.js';
@@ -205,7 +205,7 @@ async function handleHelp(respond: Respond): Promise<void> {
 // ─── Run Task Modal ─────────────────────────────────────────────────
 
 /** Open a modal for structured task submission. */
-async function openRunModal(client: any, triggerId: string): Promise<void> {
+async function openRunModal(client: WebClient, triggerId: string): Promise<void> {
   // Fetch agents for the dropdown
   let agentOptions: { text: { type: 'plain_text'; text: string }; value: string }[] = [];
   try {

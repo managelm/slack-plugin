@@ -36,6 +36,7 @@ oauth_config:
     bot:
       - chat:write
       - commands
+      - views:write
 
 settings:
   interactivity:
