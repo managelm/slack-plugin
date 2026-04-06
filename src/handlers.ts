@@ -1,11 +1,15 @@
 /**
- * Slack command handlers, interactive actions, and ManageLM webhook receiver.
+ * Slack command handlers, interactive actions, and modal views.
  *
  * Slash command: /managelm <subcommand> [args]
  *   status                    — list agents with online/offline state
  *   approve <hostname>        — approve a pending agent
- *   run <hostname> <skill> <instruction>  — submit a task
+ *   run [hostname skill ...]  — open modal (no args) or submit inline
  *   help                      — show available commands
+ *
+ * Modal: run_task_modal
+ *   Opened by `/managelm run` (no args) — lets user pick agent, skill,
+ *   and type an instruction in a structured form.
  *
  * Actions (buttons in messages):
  *   approve_agent   — approve a pending agent (from enrollment notification)
@@ -13,6 +17,7 @@
  */
 
 import type { App, SlackCommandMiddlewareArgs, BlockAction, ButtonAction } from '@slack/bolt';
+import type { ViewSubmitAction } from '@slack/bolt';
 import * as mlm from './managelm.js';
 import { config } from './config.js';
 import { STATUS_ICONS } from './formatters.js';
@@ -20,7 +25,7 @@ import { STATUS_ICONS } from './formatters.js';
 // ─── Slash command ───────────────────────────────────────────────────
 
 export function registerCommands(app: App): void {
-  app.command('/managelm', async ({ command, ack, respond }) => {
+  app.command('/managelm', async ({ command, ack, respond, client }) => {
     await ack();
 
     const args = command.text.trim().split(/\s+/);
@@ -35,7 +40,12 @@ export function registerCommands(app: App): void {
           await handleApprove(args.slice(1), respond);
           break;
         case 'run':
-          await handleRun(args.slice(1), respond);
+          // No args → open modal; with args → inline execution
+          if (args.length < 4) {
+            await openRunModal(client, command.trigger_id);
+          } else {
+            await handleRun(args.slice(1), respond);
+          }
           break;
         case 'help':
         default:
@@ -111,16 +121,8 @@ async function handleApprove(args: string[], respond: Respond): Promise<void> {
   });
 }
 
-/** /managelm run <hostname> <skill> <instruction...> — submit a task. */
+/** /managelm run <hostname> <skill> <instruction...> — inline task submit. */
 async function handleRun(args: string[], respond: Respond): Promise<void> {
-  if (args.length < 3) {
-    await respond({
-      response_type: 'ephemeral',
-      text: 'Usage: `/managelm run <hostname> <skill> <instruction>`\nExample: `/managelm run web-prod-01 packages List outdated packages`',
-    });
-    return;
-  }
-
   const [hostname, skill, ...rest] = args;
   const instruction = rest.join(' ');
 
@@ -135,7 +137,6 @@ async function handleRun(args: string[], respond: Respond): Promise<void> {
     return;
   }
 
-  // Acknowledge immediately — task may take a while
   await respond({
     response_type: 'in_channel',
     text: `:hourglass_flowing_sand: Running task on \`${agent.hostname}\`...\n*Skill:* ${skill}\n*Instruction:* ${instruction}`,
@@ -145,7 +146,6 @@ async function handleRun(args: string[], respond: Respond): Promise<void> {
     const result = await mlm.runTask(agent.id, skill, instruction);
     const task = result.task;
 
-    // Interactive task — agent needs user input
     if (task.status === 'needs_input') {
       const question = task.question || 'The agent needs more information.';
       await respond({
@@ -191,7 +191,7 @@ async function handleHelp(respond: Respond): Promise<void> {
             '',
             '`/managelm status` — List all agents with their status',
             '`/managelm approve <hostname>` — Approve a pending agent',
-            '`/managelm run <hostname> <skill> <instruction>` — Run a task on an agent',
+            '`/managelm run` — Open task form (or inline: `/managelm run <host> <skill> <instruction>`)',
             '`/managelm help` — Show this help message',
             '',
             `_Connected to ${config.portalPublicUrl}_`,
@@ -199,6 +199,154 @@ async function handleHelp(respond: Respond): Promise<void> {
         },
       },
     ],
+  });
+}
+
+// ─── Run Task Modal ─────────────────────────────────────────────────
+
+/** Open a modal for structured task submission. */
+async function openRunModal(client: any, triggerId: string): Promise<void> {
+  // Fetch agents for the dropdown
+  let agentOptions: { text: { type: 'plain_text'; text: string }; value: string }[] = [];
+  try {
+    const agents = await mlm.listAgents();
+    agentOptions = agents
+      .filter(a => a.status === 'online')
+      .map(a => ({
+        text: { type: 'plain_text' as const, text: a.display_name || a.hostname },
+        value: a.id,
+      }));
+  } catch {
+    // Fall back to empty — user can still type a hostname
+  }
+
+  if (agentOptions.length === 0) {
+    agentOptions = [{ text: { type: 'plain_text', text: 'No online agents' }, value: '_none_' }];
+  }
+
+  await client.views.open({
+    trigger_id: triggerId,
+    view: {
+      type: 'modal',
+      callback_id: 'run_task_modal',
+      title: { type: 'plain_text', text: 'Run Task' },
+      submit: { type: 'plain_text', text: 'Run' },
+      close: { type: 'plain_text', text: 'Cancel' },
+      blocks: [
+        {
+          type: 'input',
+          block_id: 'agent_block',
+          label: { type: 'plain_text', text: 'Server' },
+          element: {
+            type: 'static_select',
+            action_id: 'agent_select',
+            placeholder: { type: 'plain_text', text: 'Choose a server' },
+            options: agentOptions,
+          },
+        },
+        {
+          type: 'input',
+          block_id: 'skill_block',
+          label: { type: 'plain_text', text: 'Skill' },
+          element: {
+            type: 'static_select',
+            action_id: 'skill_select',
+            placeholder: { type: 'plain_text', text: 'Choose a skill' },
+            options: [
+              { text: { type: 'plain_text', text: 'Base (read-only)' }, value: 'base' },
+              { text: { type: 'plain_text', text: 'System' }, value: 'system' },
+              { text: { type: 'plain_text', text: 'Packages' }, value: 'packages' },
+              { text: { type: 'plain_text', text: 'Services' }, value: 'services' },
+              { text: { type: 'plain_text', text: 'Users' }, value: 'users' },
+              { text: { type: 'plain_text', text: 'Network' }, value: 'network' },
+              { text: { type: 'plain_text', text: 'Security' }, value: 'security' },
+              { text: { type: 'plain_text', text: 'Firewall' }, value: 'firewall' },
+              { text: { type: 'plain_text', text: 'Docker' }, value: 'docker' },
+              { text: { type: 'plain_text', text: 'Files' }, value: 'files' },
+            ],
+          },
+        },
+        {
+          type: 'input',
+          block_id: 'instruction_block',
+          label: { type: 'plain_text', text: 'Instruction' },
+          element: {
+            type: 'plain_text_input',
+            action_id: 'instruction_input',
+            multiline: true,
+            placeholder: { type: 'plain_text', text: 'e.g. List outdated packages' },
+          },
+        },
+      ],
+    },
+  });
+}
+
+// ─── Modal submission handler ───────────────────────────────────────
+
+export function registerModals(app: App): void {
+  app.view('run_task_modal', async ({ ack, view, client }) => {
+    const agentId = view.state.values.agent_block.agent_select.selected_option?.value || '';
+    const skill = view.state.values.skill_block.skill_select.selected_option?.value || '';
+    const instruction = view.state.values.instruction_block.instruction_input.value || '';
+
+    if (agentId === '_none_') {
+      await ack({ response_action: 'errors', errors: { agent_block: 'No online agents available' } });
+      return;
+    }
+
+    if (!agentId || !skill || !instruction) {
+      await ack({ response_action: 'errors', errors: { instruction_block: 'All fields are required' } });
+      return;
+    }
+
+    await ack();
+
+    // Post progress to the user's DM or alerts channel
+    const channel = config.channelInfo || config.channelAlerts || '';
+    if (!channel) return;
+
+    try {
+      const agent = await mlm.getAgent(agentId);
+      const agentName = agent.display_name || agent.hostname;
+
+      await client.chat.postMessage({
+        token: config.slackBotToken,
+        channel,
+        text: `:hourglass_flowing_sand: Running task on \`${agentName}\`...\n*Skill:* ${skill}\n*Instruction:* ${instruction}`,
+      });
+
+      const result = await mlm.runTask(agentId, skill, instruction);
+      const task = result.task;
+
+      if (task.status === 'needs_input') {
+        await client.chat.postMessage({
+          token: config.slackBotToken,
+          channel,
+          text: `:question: *Input needed* on \`${agentName}\`\n*Question:* ${task.question || 'The agent needs more information.'}\n_Answer in the portal._`,
+        });
+        return;
+      }
+
+      const status = task.status === 'completed' ? ':white_check_mark:'
+        : task.status === 'timeout' ? ':hourglass:' : ':x:';
+      const summary = task.status === 'timeout'
+        ? 'Task timed out — the agent did not respond in time'
+        : (task.summary || task.error_message || 'No output');
+
+      await client.chat.postMessage({
+        token: config.slackBotToken,
+        channel,
+        text: `${status} *Task ${task.status}* on \`${agentName}\`\n*Skill:* ${skill}\n*Result:* ${summary}`,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Task failed';
+      await client.chat.postMessage({
+        token: config.slackBotToken,
+        channel,
+        text: `:x: Task failed: ${message}`,
+      }).catch(() => {});
+    }
   });
 }
 

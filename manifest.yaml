@@ -41,7 +41,7 @@ settings:
   interactivity:
     is_enabled: true
     # Replace <YOUR_HOST> with your plugin's public URL
-    request_url: https://<YOUR_HOST>:3100/slack/events
+    request_url: https://<YOUR_HOST>/slack/events
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false

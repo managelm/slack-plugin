@@ -21,18 +21,19 @@ agent status, approve pending servers, or run tasks on any managed host.
 
 ```
 ManageLM Portal ── webhook (HMAC) ──> Slack Plugin ──> Slack API
-                                       :3101/webhook    (notifications)
+                                       /webhook         (notifications)
 
 Slack Users ── /managelm ──> Slack Plugin ──> ManageLM Portal API
-                              :3100           (status, approve, run tasks)
+                              /slack/events   (status, approve, run tasks)
 ```
 
-The plugin runs two lightweight HTTP servers:
+Everything runs on a single HTTP server:
 
-| Port | Purpose |
-|------|---------|
-| 3100 | Slack Bolt app — slash commands, interactive buttons |
-| 3101 | ManageLM webhook receiver — event notifications |
+| Route | Purpose |
+|-------|---------|
+| `/slack/events` | Slack Bolt — commands, interactive buttons, modals |
+| `/webhook` | ManageLM webhook receiver (HMAC-verified) |
+| `/health` | Health check |
 
 ## Setup
 
@@ -104,7 +105,7 @@ In the ManageLM portal, go to **Settings > Webhooks** and create a webhook:
 
 | Field | Value |
 |-------|-------|
-| URL | `https://<your-host>:3101/webhook` |
+| URL | `https://<your-host>:3100/webhook` |
 | Events | Select all events you want notifications for |
 | Secret | Same value as `MANAGELM_WEBHOOK_SECRET` in your `.env` |
 
@@ -125,7 +126,7 @@ npm start
 
 ```bash
 docker build -t managelm-slack .
-docker run --env-file .env -p 3100:3100 -p 3101:3101 managelm-slack
+docker run --env-file .env -p 3100:3100 managelm-slack
 ```
 
 **Docker Compose:**
@@ -137,7 +138,6 @@ services:
     env_file: .env
     ports:
       - "3100:3100"
-      - "3101:3101"
     restart: unless-stopped
 ```
 
@@ -208,7 +208,7 @@ events will be posted there.
 | `MANAGELM_API_KEY` | Yes | ManageLM API key (`mlm_ak_...`) |
 | `MANAGELM_WEBHOOK_SECRET` | No | HMAC secret for webhook verification |
 | `MANAGELM_PORTAL_PUBLIC_URL` | No | Public URL for "View in Portal" links (defaults to `MANAGELM_PORTAL_URL`) |
-| `PORT` | No | Bolt app port (default: `3100`, webhook runs on `PORT+1`) |
+| `PORT` | No | HTTP server port (default: `3100`) — all routes on one port |
 | `SLACK_CHANNEL_ALERTS` | No | Channel ID for alert events |
 | `SLACK_CHANNEL_INFO` | No | Channel ID for informational events |
 

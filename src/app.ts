@@ -1,49 +1,35 @@
 /**
  * ManageLM Slack Plugin — main entry point.
  *
- * Runs a Slack Bolt app that:
- * 1. Receives ManageLM webhook events and posts rich notifications to Slack.
- * 2. Provides /managelm slash commands for status, approve, run, help.
- * 3. Handles interactive buttons (approve agent, view task details).
+ * Single-port architecture: Bolt handles Slack events, slash commands,
+ * interactive actions, and ManageLM webhook delivery on one HTTP server.
+ *
+ * Routes:
+ *   /slack/events   — Slack events + commands + interactivity (Bolt)
+ *   /webhook        — ManageLM webhook receiver (HMAC-verified)
+ *   /health         — Health check
  *
  * Supports two modes:
- * - Socket Mode (recommended for development): set SLACK_APP_TOKEN
- * - HTTP Mode (production): receives Slack events + ManageLM webhooks on PORT
- *
- * ManageLM webhook receiver runs on the same HTTP server at /webhook.
+ * - Socket Mode (development): set SLACK_APP_TOKEN — webhooks still need HTTP
+ * - HTTP Mode (production): everything on PORT
  */
 
 import { App, LogLevel } from '@slack/bolt';
 import { createHmac, timingSafeEqual } from 'crypto';
-import { createServer } from 'http';
+import type { IncomingMessage, ServerResponse } from 'http';
 import { config, useSocketMode } from './config.js';
-import { registerCommands, registerActions } from './handlers.js';
+import { registerCommands, registerActions, registerModals } from './handlers.js';
 import { formatWebhookEvent, routeEventToChannel, type WebhookPayload } from './formatters.js';
 
-// ─── Slack Bolt app ──────────────────────────────────────────────────
+// ─── Webhook secret (required) ──────────────────────────────────────
 
-const app = new App({
-  token: config.slackBotToken,
-  signingSecret: config.slackSigningSecret,
-  ...(useSocketMode
-    ? { socketMode: true, appToken: config.slackAppToken }
-    : {}),
-  logLevel: LogLevel.INFO,
-});
+const webhookSecret = process.env.MANAGELM_WEBHOOK_SECRET || '';
+if (!webhookSecret) {
+  console.warn('[webhook] WARNING: MANAGELM_WEBHOOK_SECRET is not set — /webhook will reject all requests.');
+}
 
-// Register slash commands and button actions
-registerCommands(app);
-registerActions(app);
+// ─── HMAC verification ──────────────────────────────────────────────
 
-// ─── ManageLM webhook receiver ───────────────────────────────────────
-
-/** Slack Block Kit text limit — truncate before sending. */
-const SLACK_TEXT_LIMIT = 2900;
-
-/**
- * Verify HMAC-SHA256 signature from ManageLM webhook.
- * The portal signs the JSON body with the webhook secret.
- */
 function verifyHmac(body: string, signature: string | undefined, secret: string): boolean {
   if (!signature) return false;
   const expected = createHmac('sha256', secret).update(body).digest('hex');
@@ -51,14 +37,20 @@ function verifyHmac(body: string, signature: string | undefined, secret: string)
   return timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
-/** Maximum retries for Slack API rate limits. */
+// ─── Slack posting with retry ───────────────────────────────────────
+
+/** Slack Block Kit text limit — truncate before sending. */
+const SLACK_TEXT_LIMIT = 2900;
 const MAX_RETRIES = 3;
+
+/** Reference to the Bolt app — set after creation. */
+let appRef: App;
 
 /**
  * Post a ManageLM event to the appropriate Slack channel.
  * Retries on Slack rate limits (429) with Retry-After header.
  */
-async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
+export async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
   const message = formatWebhookEvent(payload);
   if (!message) {
     console.warn(`[webhook] Unknown event type: ${payload.event}`);
@@ -84,13 +76,13 @@ async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: strin
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await app.client.chat.postMessage({
+      await appRef.client.chat.postMessage({
         token: config.slackBotToken,
         channel,
         text: message.text,
         blocks,
       });
-      return; // Success
+      return;
     } catch (err: unknown) {
       const slackErr = err as { data?: { error?: string }; retryAfter?: number };
       if (slackErr.data?.error === 'ratelimited' && attempt < MAX_RETRIES) {
@@ -99,113 +91,103 @@ async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: strin
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
-      // Log but don't throw — webhook should still return 200
       console.error(`[webhook] Failed to post to Slack (channel=${channel}, event=${payload.event}):`, err);
       return;
     }
   }
 }
 
-// ─── HTTP webhook server (handles ManageLM POST /webhook) ────────────
+// ─── Custom route handlers (mounted on Bolt's HTTP server) ──────────
 
-// Webhook secret — REQUIRED for security. Rejects unsigned requests.
-const webhookSecret = process.env.MANAGELM_WEBHOOK_SECRET || '';
-if (!webhookSecret) {
-  console.warn('[webhook] WARNING: MANAGELM_WEBHOOK_SECRET is not set — webhook endpoint will reject all requests.');
-  console.warn('[webhook] Set MANAGELM_WEBHOOK_SECRET to the secret from your ManageLM webhook configuration.');
-}
+/** POST /webhook — ManageLM webhook receiver. */
+function webhookHandler(req: IncomingMessage, res: ServerResponse): void {
+  if (!webhookSecret) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Webhook secret not configured' }));
+    return;
+  }
 
-function startWebhookServer(): void {
-  const server = createServer(async (req, res) => {
-    // Health check
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', service: 'managelm-slack' }));
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const MAX_BODY = 512 * 1024;
+
+  req.on('data', (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > MAX_BODY) { req.destroy(); return; }
+    chunks.push(chunk);
+  });
+
+  req.on('end', async () => {
+    if (size > MAX_BODY) {
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Payload too large' }));
       return;
     }
-
-    // ManageLM webhook endpoint
-    if (req.method === 'POST' && req.url === '/webhook') {
-      // Reject early if no secret configured
-      if (!webhookSecret) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Webhook secret not configured' }));
+    const body = Buffer.concat(chunks).toString('utf-8');
+    try {
+      const signature = req.headers['x-webhook-signature'] as string | undefined;
+      if (!verifyHmac(body, signature, webhookSecret)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid signature' }));
         return;
       }
 
-      const chunks: Buffer[] = [];
-      let size = 0;
-      let oversized = false;
-      const MAX_BODY = 512 * 1024;  // 512 KB
-      req.on('data', (chunk: Buffer) => {
-        size += chunk.length;
-        if (size > MAX_BODY) { oversized = true; req.destroy(); return; }
-        chunks.push(chunk);
-      });
-      req.on('end', async () => {
-        if (oversized) {
-          res.writeHead(413, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Payload too large' }));
-          return;
-        }
-        const body = Buffer.concat(chunks).toString('utf-8');
-        try {
-          // Always verify HMAC signature
-          const signature = req.headers['x-webhook-signature'] as string | undefined;
-          if (!verifyHmac(body, signature, webhookSecret)) {
-            console.warn('[webhook] Invalid HMAC signature');
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid signature' }));
-            return;
-          }
+      const payload = JSON.parse(body) as WebhookPayload;
+      if (!payload.event || !payload.data) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing event or data fields' }));
+        return;
+      }
+      console.log(`[webhook] Received event: ${payload.event}`);
 
-          const payload = JSON.parse(body) as WebhookPayload;
-          if (!payload.event || !payload.data) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Missing event or data fields' }));
-            return;
-          }
-          console.log(`[webhook] Received event: ${payload.event}`);
+      const fallbackChannel = config.channelAlerts || config.channelInfo || '';
+      await postEventToSlack(payload, fallbackChannel);
 
-          // Determine fallback channel from env
-          const fallbackChannel = config.channelAlerts || config.channelInfo || '';
-
-          await postEventToSlack(payload, fallbackChannel);
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
-        } catch (err) {
-          console.error('[webhook] Error processing webhook:', err);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Internal error' }));
-        }
-      });
-      return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err) {
+      console.error('[webhook] Error processing webhook:', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal error' }));
     }
-
-    // 404 for everything else
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
-  });
-
-  const webhookPort = config.port + 1;  // Webhook listener on port+1
-  server.listen(webhookPort, () => {
-    console.log(`[webhook] ManageLM webhook receiver listening on port ${webhookPort}`);
-    console.log(`[webhook] Register this URL in ManageLM: http://<this-host>:${webhookPort}/webhook`);
   });
 }
+
+/** GET /health — Health check. */
+function healthHandler(_req: IncomingMessage, res: ServerResponse): void {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ status: 'ok', service: 'managelm-slack' }));
+}
+
+// ─── Bolt app with custom routes ────────────────────────────────────
+
+const app = new App({
+  token: config.slackBotToken,
+  signingSecret: config.slackSigningSecret,
+  ...(useSocketMode
+    ? { socketMode: true, appToken: config.slackAppToken }
+    : {}),
+  logLevel: LogLevel.INFO,
+  customRoutes: [
+    { path: '/webhook', method: 'POST', handler: webhookHandler },
+    { path: '/health', method: 'GET', handler: healthHandler },
+  ],
+});
+appRef = app;
+
+// Register slash commands, button actions, and modal handlers
+registerCommands(app);
+registerActions(app);
+registerModals(app);
 
 // ─── Startup ─────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // Start the Bolt app
   await app.start(config.port);
   console.log(`[slack] ManageLM Slack plugin running on port ${config.port}`);
   console.log(`[slack] Mode: ${useSocketMode ? 'Socket Mode' : 'HTTP'}`);
   console.log(`[slack] Portal: ${config.portalUrl}`);
-
-  // Start the webhook receiver alongside the Bolt app
-  startWebhookServer();
+  console.log(`[slack] Webhook: http://<this-host>:${config.port}/webhook`);
 }
 
 main().catch((err) => {
