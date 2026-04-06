@@ -12,10 +12,12 @@ agent status, approve pending servers, or run tasks on any managed host.
 
 - **Real-time notifications** — agent enrollment, online/offline, task completed/failed/needs_input
 - **Slash commands** — `/managelm status`, `approve`, `run`, `help`
+- **Run task modal** — `/managelm run` opens a form to pick server, skill, and instruction
 - **Interactive buttons** — approve agents and view task details inline
 - **Channel routing** — send alerts to `#ops-alerts` and info to `#ops-general`
-- **HMAC verification** — cryptographic signature on every webhook delivery
+- **HMAC verification** — cryptographic signature on every webhook delivery (required)
 - **Socket Mode or HTTP** — develop locally with Socket Mode, deploy with HTTP
+- **Single port** — Slack events, webhooks, and health check on one HTTP server
 
 ## Architecture
 
@@ -51,7 +53,7 @@ Everything runs on a single HTTP server:
 
 1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App > From scratch**
 2. Name it **ManageLM** and select your workspace
-3. Under **OAuth & Permissions**, add bot scopes: `chat:write`, `commands`
+3. Under **OAuth & Permissions**, add bot scopes: `chat:write`, `commands`, `views:write`
 4. Under **Slash Commands**, create `/managelm` with Request URL `https://<your-host>:3100/slack/events`
 5. Under **Interactivity**, enable and set Request URL to `https://<your-host>:3100/slack/events`
 
@@ -147,7 +149,8 @@ services:
 |---------|-------------|
 | `/managelm status` | List all agents with online/offline status |
 | `/managelm approve <hostname>` | Approve a pending agent |
-| `/managelm run <hostname> <skill> <instruction>` | Run a task on an agent |
+| `/managelm run` | Open a modal form to pick server, skill, and instruction |
+| `/managelm run <hostname> <skill> <instruction>` | Run a task inline (no modal) |
 | `/managelm help` | Show available commands |
 
 ### Examples
@@ -155,14 +158,15 @@ services:
 ```
 /managelm status
 /managelm approve web-prod-03
+/managelm run                                         # opens the task modal
 /managelm run web-prod-01 packages List outdated packages
 /managelm run db-master security Run a full security audit
-/managelm run lb-01 services Restart nginx
 ```
 
 The `run` command works exactly like submitting a task from Claude or the
 portal UI — it sends the instruction to the agent, waits for the result,
-and posts it back to the channel.
+and posts it back to the channel. Use `/managelm run` with no arguments
+to open an interactive modal with server and skill dropdowns.
 
 ## Event Notifications
 
@@ -206,7 +210,7 @@ events will be posted there.
 | `SLACK_APP_TOKEN` | No | App-level token for Socket Mode (`xapp-...`) |
 | `MANAGELM_PORTAL_URL` | Yes | ManageLM portal URL |
 | `MANAGELM_API_KEY` | Yes | ManageLM API key (`mlm_ak_...`) |
-| `MANAGELM_WEBHOOK_SECRET` | No | HMAC secret for webhook verification |
+| `MANAGELM_WEBHOOK_SECRET` | Yes | HMAC secret for webhook verification (webhook endpoint rejects requests without it) |
 | `MANAGELM_PORTAL_PUBLIC_URL` | No | Public URL for "View in Portal" links (defaults to `MANAGELM_PORTAL_URL`) |
 | `PORT` | No | HTTP server port (default: `3100`) — all routes on one port |
 | `SLACK_CHANNEL_ALERTS` | No | Channel ID for alert events |
@@ -216,11 +220,11 @@ events will be posted there.
 
 ```
 src/
-  app.ts          — entry point: Bolt app + webhook HTTP server
+  app.ts          — entry point: Bolt app with custom routes (/webhook, /health)
   config.ts       — environment variable loading and validation
   managelm.ts     — typed HTTP client for the ManageLM portal API
   formatters.ts   — Block Kit message builders for each event type
-  handlers.ts     — slash command and button action handlers
+  handlers.ts     — slash commands, button actions, and modal handlers
 ```
 
 ## Requirements
@@ -245,14 +249,14 @@ To let other people install ManageLM into their own Slack workspaces:
 Once activated, Slack gives you a **Sharable URL** like:
 
 ```
-https://slack.com/oauth/v2/authorize?client_id=YOUR_CLIENT_ID&scope=chat:write,commands
+https://slack.com/oauth/v2/authorize?client_id=YOUR_CLIENT_ID&scope=chat:write,commands,views:write
 ```
 
 You can also use Slack's official **"Add to Slack"** button. Add this HTML
 to your website or documentation:
 
 ```html
-<a href="https://slack.com/oauth/v2/authorize?client_id=YOUR_CLIENT_ID&scope=chat:write,commands&user_scope=">
+<a href="https://slack.com/oauth/v2/authorize?client_id=YOUR_CLIENT_ID&scope=chat:write,commands,views:write&user_scope=">
   <img alt="Add to Slack" height="40" width="139"
        src="https://platform.slack-edge.com/img/add_to_slack.png"
        srcSet="https://platform.slack-edge.com/img/add_to_slack.png 1x,
