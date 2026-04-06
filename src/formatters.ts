@@ -231,6 +231,61 @@ function taskNeedsInput(data: Record<string, unknown>, ts: string): FormattedMes
   };
 }
 
+function reportCompleted(data: Record<string, unknown>, ts: string): FormattedMessage {
+  const label = agentLabel(data);
+  const reportType = (data.report_type || 'report') as string;
+  const score = data.score as number | null;
+  const findingsCount = (data.findings_count || 0) as number;
+
+  let detail = '';
+  if (score != null) detail += `*Score:* ${score}/100\n`;
+  if (findingsCount > 0) detail += `*Findings:* ${findingsCount} issue${findingsCount !== 1 ? 's' : ''}`;
+  else detail += '*Findings:* No issues found';
+
+  return {
+    text: `${reportType} completed on ${label} — score ${score ?? '?'}/100`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `:white_check_mark: *${reportType.charAt(0).toUpperCase() + reportType.slice(1)} Completed* on ${label}\n${detail}\n${timestamp(ts)}`,
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
+          linkButton('View in Portal', `${config.portalPublicUrl}/pentests`),
+        ],
+      },
+    ],
+  };
+}
+
+function reportFailed(data: Record<string, unknown>, ts: string): FormattedMessage {
+  const label = agentLabel(data);
+  const reportType = (data.report_type || 'report') as string;
+
+  return {
+    text: `${reportType} FAILED on ${label}`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `${statusEmoji('failed')} *${reportType.charAt(0).toUpperCase() + reportType.slice(1)} Failed* on ${label}\n${timestamp(ts)}`,
+        },
+      },
+      {
+        type: 'actions',
+        elements: [
+          linkButton('View in Portal', `${config.portalPublicUrl}/pentests`),
+        ],
+      },
+    ],
+  };
+}
+
 // ─── Router ──────────────────────────────────────────────────────────
 
 const formatters: Record<string, (data: Record<string, unknown>, ts: string) => FormattedMessage> = {
@@ -241,6 +296,8 @@ const formatters: Record<string, (data: Record<string, unknown>, ts: string) => 
   'task.completed':    taskCompleted,
   'task.failed':       taskFailed,
   'task.needs_input':  taskNeedsInput,
+  'report.completed':  reportCompleted,
+  'report.failed':     reportFailed,
 };
 
 /**
@@ -260,7 +317,7 @@ export function formatWebhookEvent(payload: WebhookPayload): FormattedMessage | 
  * Returns empty string if no routing is configured (caller should use default).
  */
 export function routeEventToChannel(event: string): string {
-  const alertEvents = ['agent.offline', 'task.failed'];
+  const alertEvents = ['agent.offline', 'task.failed', 'report.failed'];
   if (alertEvents.includes(event) && config.channelAlerts) {
     return config.channelAlerts;
   }

@@ -1,6 +1,6 @@
 {
   "name": "managelm-slack",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Slack integration for ManageLM — receive server alerts, run tasks, and manage agents from Slack.",
   "keywords": [
     "managelm",
@@ -27,7 +27,7 @@
     "@slack/bolt": "^4.1.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^25.5.0",
     "typescript": "^5.3.0"
   }
 }
