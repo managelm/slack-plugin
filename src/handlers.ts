@@ -15,6 +15,7 @@
 import type { App, SlackCommandMiddlewareArgs, BlockAction, ButtonAction } from '@slack/bolt';
 import * as mlm from './managelm.js';
 import { config } from './config.js';
+import { STATUS_ICONS } from './formatters.js';
 
 // ─── Slash command ───────────────────────────────────────────────────
 
@@ -63,14 +64,8 @@ async function handleStatus(respond: Respond): Promise<void> {
   const order: Record<string, number> = { online: 0, offline: 1, pending: 2 };
   agents.sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
 
-  const statusIcon: Record<string, string> = {
-    online: ':large_green_circle:',
-    offline: ':red_circle:',
-    pending: ':yellow_circle:',
-  };
-
   const lines = agents.map(a => {
-    const icon = statusIcon[a.status] || ':grey_question:';
+    const icon = STATUS_ICONS[a.status] || ':grey_question:';
     const name = a.display_name || a.hostname;
     const ip = a.ip_address ? ` (${a.ip_address})` : '';
     return `${icon} \`${name}\`${ip} — ${a.status}`;
@@ -161,8 +156,11 @@ async function handleRun(args: string[], respond: Respond): Promise<void> {
       return;
     }
 
-    const status = task.status === 'completed' ? ':white_check_mark:' : ':x:';
-    const summary = task.summary || task.error_message || 'No output';
+    const status = task.status === 'completed' ? ':white_check_mark:'
+      : task.status === 'timeout' ? ':hourglass:' : ':x:';
+    const summary = task.status === 'timeout'
+      ? 'Task timed out — the agent did not respond in time'
+      : (task.summary || task.error_message || 'No output');
 
     await respond({
       response_type: 'in_channel',
@@ -241,10 +239,7 @@ export function registerActions(app: App): void {
 
     try {
       const task = await mlm.getTask(taskId);
-      const statusIcons: Record<string, string> = {
-        completed: ':white_check_mark:', failed: ':x:', needs_input: ':question:', answered: ':speech_balloon:',
-      };
-      const status = statusIcons[task.status] || ':grey_question:';
+      const status = STATUS_ICONS[task.status] || ':grey_question:';
 
       const fields: string[] = [
         `*Status:* ${task.status}`,

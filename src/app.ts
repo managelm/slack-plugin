@@ -9,6 +9,8 @@
  * Supports two modes:
  * - Socket Mode (recommended for development): set SLACK_APP_TOKEN
  * - HTTP Mode (production): receives Slack events + ManageLM webhooks on PORT
+ *
+ * ManageLM webhook receiver runs on the same HTTP server at /webhook.
  */
 
 import { App, LogLevel } from '@slack/bolt';
@@ -34,9 +36,9 @@ registerCommands(app);
 registerActions(app);
 
 // ─── ManageLM webhook receiver ───────────────────────────────────────
-// This is a separate HTTP endpoint that receives POST from ManageLM's
-// webhook system, verifies the HMAC signature, and posts to Slack.
-// It runs alongside the Bolt app on the same port (different path).
+
+/** Slack Block Kit text limit — truncate before sending. */
+const SLACK_TEXT_LIMIT = 2900;
 
 /**
  * Verify HMAC-SHA256 signature from ManageLM webhook.
@@ -49,9 +51,12 @@ function verifyHmac(body: string, signature: string | undefined, secret: string)
   return timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
+/** Maximum retries for Slack API rate limits. */
+const MAX_RETRIES = 3;
+
 /**
  * Post a ManageLM event to the appropriate Slack channel.
- * Channel selection: event routing config > fallback to first channel the bot is in.
+ * Retries on Slack rate limits (429) with Retry-After header.
  */
 async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
   const message = formatWebhookEvent(payload);
@@ -66,21 +71,48 @@ async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: strin
     return;
   }
 
-  await app.client.chat.postMessage({
-    token: config.slackBotToken,
-    channel,
-    text: message.text,
-    blocks: message.blocks,
+  // Truncate text blocks to stay within Slack limits
+  const blocks = message.blocks.map(block => {
+    if (block.type === 'section' && 'text' in block && block.text && 'text' in block.text) {
+      const txt = block.text.text;
+      if (txt.length > SLACK_TEXT_LIMIT) {
+        return { ...block, text: { ...block.text, text: txt.slice(0, SLACK_TEXT_LIMIT) + '\n…_(truncated)_' } };
+      }
+    }
+    return block;
   });
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await app.client.chat.postMessage({
+        token: config.slackBotToken,
+        channel,
+        text: message.text,
+        blocks,
+      });
+      return; // Success
+    } catch (err: unknown) {
+      const slackErr = err as { data?: { error?: string }; retryAfter?: number };
+      if (slackErr.data?.error === 'ratelimited' && attempt < MAX_RETRIES) {
+        const delay = (slackErr.retryAfter ?? 1) * 1000;
+        console.warn(`[webhook] Slack rate limited — retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      // Log but don't throw — webhook should still return 200
+      console.error(`[webhook] Failed to post to Slack (channel=${channel}, event=${payload.event}):`, err);
+      return;
+    }
+  }
 }
 
 // ─── HTTP webhook server (handles ManageLM POST /webhook) ────────────
 
-// The webhook secret used when registering the webhook in ManageLM.
-// Set via MANAGELM_WEBHOOK_SECRET env var.
+// Webhook secret — REQUIRED for security. Rejects unsigned requests.
 const webhookSecret = process.env.MANAGELM_WEBHOOK_SECRET || '';
 if (!webhookSecret) {
-  console.warn('[webhook] WARNING: MANAGELM_WEBHOOK_SECRET is not set — webhook endpoint will accept unsigned requests!');
+  console.warn('[webhook] WARNING: MANAGELM_WEBHOOK_SECRET is not set — webhook endpoint will reject all requests.');
+  console.warn('[webhook] Set MANAGELM_WEBHOOK_SECRET to the secret from your ManageLM webhook configuration.');
 }
 
 function startWebhookServer(): void {
@@ -94,10 +126,17 @@ function startWebhookServer(): void {
 
     // ManageLM webhook endpoint
     if (req.method === 'POST' && req.url === '/webhook') {
+      // Reject early if no secret configured
+      if (!webhookSecret) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Webhook secret not configured' }));
+        return;
+      }
+
       const chunks: Buffer[] = [];
       let size = 0;
       let oversized = false;
-      const MAX_BODY = 512 * 1024;  // 512 KB — more than enough for webhook payloads
+      const MAX_BODY = 512 * 1024;  // 512 KB
       req.on('data', (chunk: Buffer) => {
         size += chunk.length;
         if (size > MAX_BODY) { oversized = true; req.destroy(); return; }
@@ -111,18 +150,21 @@ function startWebhookServer(): void {
         }
         const body = Buffer.concat(chunks).toString('utf-8');
         try {
-          // Verify HMAC if secret is configured
-          if (webhookSecret) {
-            const signature = req.headers['x-webhook-signature'] as string | undefined;
-            if (!verifyHmac(body, signature, webhookSecret)) {
-              console.warn('[webhook] Invalid HMAC signature');
-              res.writeHead(401, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Invalid signature' }));
-              return;
-            }
+          // Always verify HMAC signature
+          const signature = req.headers['x-webhook-signature'] as string | undefined;
+          if (!verifyHmac(body, signature, webhookSecret)) {
+            console.warn('[webhook] Invalid HMAC signature');
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid signature' }));
+            return;
           }
 
           const payload = JSON.parse(body) as WebhookPayload;
+          if (!payload.event || !payload.data) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing event or data fields' }));
+            return;
+          }
           console.log(`[webhook] Received event: ${payload.event}`);
 
           // Determine fallback channel from env

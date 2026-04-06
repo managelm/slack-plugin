@@ -20,19 +20,23 @@ interface FormattedMessage {
   blocks: KnownBlock[];
 }
 
+// ─── Shared status icons (used by formatters + handlers) ────────────
+
+export const STATUS_ICONS: Record<string, string> = {
+  online:      ':large_green_circle:',
+  offline:     ':red_circle:',
+  pending:     ':yellow_circle:',
+  completed:   ':white_check_mark:',
+  failed:      ':x:',
+  timeout:     ':hourglass:',
+  needs_input: ':question:',
+  answered:    ':speech_balloon:',
+};
+
 // ─── Helpers ─────────────────────────────────────────────────────────
 
 function statusEmoji(status: string): string {
-  switch (status) {
-    case 'online':    return ':large_green_circle:';
-    case 'offline':   return ':red_circle:';
-    case 'pending':   return ':yellow_circle:';
-    case 'completed':   return ':white_check_mark:';
-    case 'failed':      return ':x:';
-    case 'needs_input': return ':question:';
-    case 'answered':    return ':speech_balloon:';
-    default:            return ':grey_question:';
-  }
+  return STATUS_ICONS[status] || ':grey_question:';
 }
 
 function agentLabel(data: Record<string, unknown>): string {
