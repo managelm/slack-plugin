@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # Load GitHub token from shared config
-TOKEN_FILE="$(dirname "$0")/../.github-token"
+TOKEN_FILE="$(dirname "$0")/../../.github-token"
 if [ -z "${GITHUB_TOKEN:-}" ] && [ -f "$TOKEN_FILE" ]; then
   source "$TOKEN_FILE"
 fi
@@ -40,12 +40,14 @@ if [ -z "${GITHUB_TOKEN:-}" ]; then
   echo "ERROR: GITHUB_TOKEN env var is required."
   exit 1
 fi
+# Ensure the token reaches the git credential-helper subprocess below.
+export GITHUB_TOKEN
 
 if ! git remote get-url github &>/dev/null; then
   echo "▸ Adding github remote..."
-  git remote add github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+  git remote add github "https://github.com/${GITHUB_REPO}.git"
 else
-  git remote set-url github "https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git"
+  git remote set-url github "https://github.com/${GITHUB_REPO}.git"
 fi
 
 # ── Check for uncommitted changes (tracked files only) ───────────
@@ -66,7 +68,12 @@ git tag -f "$TAG" -m "Release ${VERSION}"
 
 # ── Push to GitHub ───────────────────────────────────────────────
 echo "▸ Pushing to GitHub..."
-git push github "${BRANCH}:main" --tags --force
+# Ephemeral credential helper: the token stays in the environment only — it is
+# never written to .git/config (the old URL-embedded form persisted it on disk
+# via remote set-url) and never appears expanded in process argv.
+git -c credential.helper= \
+    -c credential.helper='!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN}"; }; f' \
+    push github "${BRANCH}:main" --tags --force
 
 # ── Delete existing release if re-deploying same version ─────────
 EXISTING=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -120,7 +127,7 @@ if [ "$UPLOAD_URL" = "null" ] || [ -z "$UPLOAD_URL" ]; then
   echo "Tag and code were pushed. Create the release manually at:"
   echo "  https://github.com/${GITHUB_REPO}/releases/new?tag=${TAG}"
   [[ "$(pwd)" == "/" ]] && { echo "FATAL: pwd is /"; exit 1; }
-  chown -R claude:claude "$(pwd)"
+  [ "$(id -u)" -eq 0 ] && chown -R "$(stat -c '%U:%G' "$(pwd)")" "$(pwd)" || true
   exit 1
 fi
 
@@ -135,7 +142,7 @@ RELEASE_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.html_url')
 
 # Restore ownership (scripts may run as root)
 [[ "$(pwd)" == "/" ]] && { echo "FATAL: pwd is /"; exit 1; }
-chown -R claude:claude "$(pwd)"
+[ "$(id -u)" -eq 0 ] && chown -R "$(stat -c '%U:%G' "$(pwd)")" "$(pwd)" || true
 
 echo ""
 echo "Done: ${PLUGIN_NAME} ${VERSION}"
