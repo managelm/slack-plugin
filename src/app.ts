@@ -43,14 +43,12 @@ function verifyHmac(body: string, signature: string | undefined, secret: string)
 const SLACK_TEXT_LIMIT = 2900;
 const MAX_RETRIES = 3;
 
-/** Reference to the Bolt app — set after creation. */
-let appRef: App;
-
 /**
  * Post a ManageLM event to the appropriate Slack channel.
  * Retries on Slack rate limits (429) with Retry-After header.
+ * The Bolt app is passed in explicitly (no mutable module global).
  */
-export async function postEventToSlack(payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
+export async function postEventToSlack(app: App, payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
   const message = formatWebhookEvent(payload);
   if (!message) {
     console.warn(`[webhook] Unknown event type: ${payload.event}`);
@@ -76,7 +74,7 @@ export async function postEventToSlack(payload: WebhookPayload, fallbackChannel?
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await appRef.client.chat.postMessage({
+      await app.client.chat.postMessage({
         token: config.slackBotToken,
         channel,
         text: message.text,
@@ -157,7 +155,7 @@ async function processWebhookBody(
   console.log(`[webhook] Received event: ${payload.event}`);
 
   const fallbackChannel = config.channelAlerts || config.channelInfo || '';
-  await postEventToSlack(payload, fallbackChannel);
+  await postEventToSlack(app, payload, fallbackChannel);
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
@@ -183,7 +181,6 @@ const app = new App({
     { path: '/health', method: 'GET', handler: healthHandler },
   ],
 });
-appRef = app;
 
 // Register slash commands, button actions, and modal handlers
 registerCommands(app);
