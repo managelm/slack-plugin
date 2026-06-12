@@ -133,10 +133,18 @@ fi
 
 # ── Upload tarball as release asset ──────────────────────────────
 echo "▸ Uploading ${TARBALL}..."
-curl -s -X POST "${UPLOAD_URL}?name=${TARBALL}" \
+UPLOAD_RESPONSE=$(curl -sS -X POST "${UPLOAD_URL}?name=${TARBALL}" \
   -H "Authorization: token ${GITHUB_TOKEN}" \
   -H "Content-Type: application/gzip" \
-  --data-binary "@${TARBALL}" | jq -r '.state' > /dev/null
+  --data-binary "@${TARBALL}")
+# A release without its asset is broken for users — fail loudly instead
+# of printing "Done" with nothing attached (the old `| jq > /dev/null`
+# swallowed every upload error).
+if [ "$(echo "$UPLOAD_RESPONSE" | jq -r '.state // empty')" != "uploaded" ]; then
+  echo "ERROR: Asset upload failed. Response:"
+  echo "$UPLOAD_RESPONSE" | jq -r '.message // .'
+  exit 1
+fi
 
 RELEASE_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.html_url')
 
