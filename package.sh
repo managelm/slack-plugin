@@ -35,10 +35,14 @@ done
 # ── Build ─────────────────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
   echo "▸ Installing dependencies..."
-  npm ci
+  npm ci --no-audit --no-fund
+
+  # Audit only what ships (prod deps); warn instead of npm's full report
+  npm audit --omit=dev >/dev/null 2>&1 \
+    || echo "  ⚠ npm audit reports vulnerabilities in production dependencies (run: npm audit --omit=dev)"
 
   echo "▸ Compiling TypeScript..."
-  npx tsc
+  npm run build --silent
 else
   echo "▸ Skipping build (--skip-build)"
   if [ ! -d dist ]; then
@@ -59,7 +63,7 @@ cp -r dist "$TARGET/"
 # Production dependencies only
 cp package.json package-lock.json "$TARGET/"
 cd "$TARGET"
-npm ci --omit=dev --ignore-scripts
+npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 cd "$ROOT_DIR"
 
 # Config and docs
