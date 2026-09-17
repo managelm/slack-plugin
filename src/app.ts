@@ -10,7 +10,8 @@
  *   /health         — Health check
  *
  * Supports two modes:
- * - Socket Mode (development): set SLACK_APP_TOKEN — webhooks still need HTTP
+ * - Socket Mode (development): set SLACK_APP_TOKEN — Slack events arrive over
+ *   the socket; /webhook and /health still listen on PORT
  * - HTTP Mode (production): everything on PORT
  */
 
@@ -19,7 +20,7 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import type { IncomingMessage, ServerResponse } from 'http';
 import { config, useSocketMode } from './config.js';
 import { registerCommands, registerActions, registerModals } from './handlers.js';
-import { formatWebhookEvent, routeEventToChannel, type WebhookPayload } from './formatters.js';
+import { formatWebhookEvent, routeEventToChannel, truncate, type WebhookPayload } from './formatters.js';
 
 // ─── Webhook secret (required) ──────────────────────────────────────
 
@@ -28,24 +29,48 @@ if (!webhookSecret) {
   console.warn('[webhook] WARNING: MANAGELM_WEBHOOK_SECRET is not set — /webhook will reject all requests.');
 }
 
-// ─── HMAC verification ──────────────────────────────────────────────
-
-function verifyHmac(body: string, signature: string | undefined, secret: string): boolean {
-  if (!signature) return false;
-  const expected = createHmac('sha256', secret).update(body).digest('hex');
-  if (expected.length !== signature.length) return false;
-  return timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+if (config.allowedUsers.length === 0 && config.allowedChannels.length === 0) {
+  console.warn('[slack] WARNING: SLACK_ALLOWED_USERS and SLACK_ALLOWED_CHANNELS are not set — anyone in the '
+    + 'Slack workspace can use /managelm with the rights of the API key owner.');
 }
 
-// ─── Slack posting with retry ───────────────────────────────────────
+// ─── Webhook verification ───────────────────────────────────────────
 
-/** Slack Block Kit text limit — truncate before sending. */
-const SLACK_TEXT_LIMIT = 2900;
-const MAX_RETRIES = 3;
+/** Largest webhook body accepted. Portal events are a few KB. */
+const MAX_BODY = 512 * 1024;
+
+/**
+ * How far a delivery's `timestamp` may sit from this clock, either way. The
+ * portal resends the same body within ~15 s when a delivery fails; a body
+ * older than this is a replay, not a retry.
+ */
+const REPLAY_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Check X-Webhook-Signature: hex HMAC-SHA256 of the raw body. Compared as
+ * bytes with a length check first, so a header of the right character count
+ * but a different byte length (non-ASCII) is a mismatch, never an exception.
+ */
+function verifyHmac(body: Buffer, signature: string, secret: string): boolean {
+  const expected = Buffer.from(createHmac('sha256', secret).update(body).digest('hex'), 'utf-8');
+  const given = Buffer.from(signature, 'utf-8');
+  if (given.byteLength !== expected.byteLength) return false;
+  return timingSafeEqual(given, expected);
+}
+
+/** True when an ISO timestamp is within REPLAY_WINDOW_MS of now. */
+function isFresh(timestamp: unknown): boolean {
+  if (typeof timestamp !== 'string') return false;
+  const time = Date.parse(timestamp);
+  return Number.isFinite(time) && Math.abs(Date.now() - time) <= REPLAY_WINDOW_MS;
+}
+
+// ─── Slack posting ──────────────────────────────────────────────────
 
 /**
  * Post a ManageLM event to the appropriate Slack channel.
- * Retries on Slack rate limits (429) with Retry-After header.
+ * Slack rate limits (429) need no handling here: the Web API client waits out
+ * Retry-After and resends by itself.
  * The Bolt app is passed in explicitly (no mutable module global).
  */
 export async function postEventToSlack(app: App, payload: WebhookPayload, fallbackChannel?: string): Promise<void> {
@@ -62,109 +87,106 @@ export async function postEventToSlack(app: App, payload: WebhookPayload, fallba
   }
 
   // Truncate text blocks to stay within Slack limits
-  const blocks = message.blocks.map(block => {
-    if (block.type === 'section' && 'text' in block && block.text && 'text' in block.text) {
-      const txt = block.text.text;
-      if (txt.length > SLACK_TEXT_LIMIT) {
-        return { ...block, text: { ...block.text, text: txt.slice(0, SLACK_TEXT_LIMIT) + '\n…_(truncated)_' } };
-      }
-    }
-    return block;
-  });
+  const blocks = message.blocks.map(block =>
+    block.type === 'section' && block.text
+      ? { ...block, text: { ...block.text, text: truncate(block.text.text) } }
+      : block,
+  );
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      await app.client.chat.postMessage({
-        token: config.slackBotToken,
-        channel,
-        text: message.text,
-        blocks,
-      });
-      return;
-    } catch (err: unknown) {
-      const slackErr = err as { data?: { error?: string }; retryAfter?: number };
-      if (slackErr.data?.error === 'ratelimited' && attempt < MAX_RETRIES) {
-        const delay = (slackErr.retryAfter ?? 1) * 1000;
-        console.warn(`[webhook] Slack rate limited — retrying in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      console.error(`[webhook] Failed to post to Slack (channel=${channel}, event=${payload.event}):`, err);
-      return;
-    }
+  try {
+    await app.client.chat.postMessage({
+      token: config.slackBotToken,
+      channel,
+      text: message.text,
+      blocks,
+    });
+  } catch (err: unknown) {
+    console.error(`[webhook] Failed to post to Slack (channel=${channel}, event=${payload.event}):`, err);
   }
 }
 
 // ─── Custom route handlers (mounted on Bolt's HTTP server) ──────────
 
+function reply(res: ServerResponse, status: number, body: Record<string, unknown>): void {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
 /** POST /webhook — ManageLM webhook receiver. */
 function webhookHandler(req: IncomingMessage, res: ServerResponse): void {
   if (!webhookSecret) {
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Webhook secret not configured' }));
+    reply(res, 503, { error: 'Webhook secret not configured' });
     return;
   }
 
   const chunks: Buffer[] = [];
   let size = 0;
-  const MAX_BODY = 512 * 1024;
+  let tooLarge = false;
 
   req.on('data', (chunk: Buffer) => {
+    if (tooLarge) return;
     size += chunk.length;
-    if (size > MAX_BODY) { req.destroy(); return; }
+    if (size > MAX_BODY) {
+      // Answer now rather than on 'end', which would mean reading the rest of
+      // an arbitrarily large body; close the connection once the 413 is out.
+      tooLarge = true;
+      chunks.length = 0;
+      res.writeHead(413, { 'Content-Type': 'application/json', Connection: 'close' });
+      res.end(JSON.stringify({ error: 'Payload too large' }), () => req.destroy());
+      return;
+    }
     chunks.push(chunk);
   });
 
-  // Wrap async processing to catch unhandled rejections
   req.on('end', () => {
-    processWebhookBody(req, res, chunks, size > MAX_BODY).catch((err) => {
-      console.error('[webhook] Unhandled error in webhook processing:', err);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Internal error' }));
-      }
-    });
+    if (!tooLarge) handleWebhookBody(req, res, Buffer.concat(chunks));
   });
 }
 
-/** Process the collected webhook body chunks. Extracted to an async function
- *  so unhandled rejections are properly caught by the caller. */
-async function processWebhookBody(
-  req: IncomingMessage, res: ServerResponse, chunks: Buffer[], oversized: boolean,
-): Promise<void> {
-  if (oversized) {
-    res.writeHead(413, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Payload too large' }));
-    return;
-  }
-  const body = Buffer.concat(chunks).toString('utf-8');
-
-  const signature = req.headers['x-webhook-signature'] as string | undefined;
-  if (!verifyHmac(body, signature, webhookSecret)) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Invalid signature' }));
+/** Verify a complete webhook body, answer the portal, then post to Slack. */
+function handleWebhookBody(req: IncomingMessage, res: ServerResponse, body: Buffer): void {
+  const signature = req.headers['x-webhook-signature'];
+  if (typeof signature !== 'string' || !verifyHmac(body, signature, webhookSecret)) {
+    reply(res, 401, { error: 'Invalid signature' });
     return;
   }
 
-  const payload = JSON.parse(body) as WebhookPayload;
-  if (!payload.event || !payload.data) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Missing event or data fields' }));
+  let payload: WebhookPayload;
+  try {
+    payload = JSON.parse(body.toString('utf-8')) as WebhookPayload;
+  } catch {
+    reply(res, 400, { error: 'Invalid JSON' });
     return;
   }
+  if (!payload || typeof payload.event !== 'string' || !payload.data || typeof payload.data !== 'object') {
+    reply(res, 400, { error: 'Missing event or data fields' });
+    return;
+  }
+
+  // The timestamp is inside the signed body, so it cannot be refreshed
+  // without the secret.
+  if (!isFresh(payload.timestamp)) {
+    reply(res, 401, { error: 'Missing or expired timestamp' });
+    return;
+  }
+
   console.log(`[webhook] Received event: ${payload.event}`);
 
-  const fallbackChannel = config.channelAlerts || config.channelInfo || '';
-  await postEventToSlack(app, payload, fallbackChannel);
+  // Answer before posting. Posting can take long — the Slack client waits out
+  // rate limits — and the portal gives up on a delivery after 10 s and sends
+  // it again, which would duplicate the message and count as a failure toward
+  // disabling the webhook.
+  reply(res, 200, { ok: true });
 
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ ok: true }));
+  const fallbackChannel = config.channelAlerts || config.channelInfo || '';
+  postEventToSlack(app, payload, fallbackChannel).catch((err) => {
+    console.error('[webhook] Unhandled error while posting to Slack:', err);
+  });
 }
 
 /** GET /health — Health check. */
 function healthHandler(_req: IncomingMessage, res: ServerResponse): void {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ status: 'ok', service: 'managelm-slack' }));
+  reply(res, 200, { status: 'ok', service: 'managelm-slack' });
 }
 
 // ─── Bolt app with custom routes ────────────────────────────────────
@@ -175,6 +197,10 @@ const app = new App({
   ...(useSocketMode
     ? { socketMode: true, appToken: config.slackAppToken }
     : {}),
+  // In Socket Mode, Bolt serves the custom routes on their own HTTP server and
+  // takes its port from here (app.start's argument is ignored there); without
+  // it they would listen on 3000 whatever PORT says.
+  port: config.port,
   logLevel: LogLevel.INFO,
   customRoutes: [
     { path: '/webhook', method: 'POST', handler: webhookHandler },

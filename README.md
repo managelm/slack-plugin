@@ -23,18 +23,19 @@
 
 ---
 
-Get real-time alerts when agents come online or go offline, when tasks complete or fail, and approve new servers — all without leaving Slack. Run tasks on any managed host with `/managelm` slash commands.
+Get real-time alerts for everything that happens in ManageLM (agents, tasks, scans, monitors, backups, certificates, credentials, keystore, pentests, admin sessions) and run tasks, scans and searches on your servers with `/managelm` slash commands, without leaving Slack.
 
 ## Features
 
-- **Real-time notifications** — agent enrollment, online/offline, task completed/failed
-- **Slash commands** — `/managelm status`, `approve`, `run`, `help`
-- **Run task modal** — `/managelm run` opens a form to pick server, skill, and instruction
-- **Interactive buttons** — approve agents and view task details inline
-- **Channel routing** — send critical alerts to `#ops-alerts`, info to `#ops-general`
-- **HMAC verification** — cryptographic signature on every webhook delivery
+- **Real-time notifications** — every ManageLM event, with a **View in Portal** link
+- **Slash commands** — `status`, `run`, `task`, `answer`, `scan`, `search`, `help`
+- **Run task modal** — `/managelm run` opens a form to pick server, skill (or Auto), and instruction
+- **Answer from Slack** — reply to a task waiting for input with `/managelm answer`, privately
+- **Channel routing** — send warnings and critical events to `#ops-alerts`, the rest to `#ops-general`
+- **Access control** — limit the bot to chosen Slack users and channels
+- **HMAC verification** — cryptographic signature and freshness check on every webhook delivery
 - **Socket Mode or HTTP** — develop locally with Socket Mode, deploy with HTTP
-- **Single port** — Slack events, webhooks, and health check on one HTTP server
+- **Single port** — Slack events, webhooks, and health check share `PORT` (in Socket Mode, Slack events use the socket)
 
 ## Quick Start
 
@@ -47,7 +48,13 @@ Use the included manifest for quick setup:
 3. Replace `<YOUR_HOST>` with your plugin's public URL
 4. Install the app to your workspace
 
-### 2. Configure
+### 2. Create an API key
+
+In the ManageLM portal, go to **Settings > MCP & API > API Keys** and create a key for the bot. The key acts as the user who creates it, limited to the authorizations ticked: add **Reports** to start scans, **Credentials** to search credentials.
+
+> **Warning:** everyone who can use the bot acts with that key's access. Slash commands work in every channel and direct message of the workspace, so unless you set `SLACK_ALLOWED_USERS` or `SLACK_ALLOWED_CHANNELS` (see [Access Control](#access-control)), anyone in the workspace can run tasks on your servers with the rights of the key's owner. Pick the user and the authorizations accordingly.
+
+### 3. Configure
 
 ```bash
 cp .env.example .env
@@ -64,17 +71,26 @@ MANAGELM_API_KEY=mlm_ak_your-key
 
 # Webhook
 MANAGELM_WEBHOOK_SECRET=your-webhook-secret
+
+# Who may use the bot (strongly recommended)
+SLACK_ALLOWED_USERS=U0123456789,U0987654321
+SLACK_ALLOWED_CHANNELS=C0123456789
 ```
 
-### 3. Register webhook
+Keep every comment on its own line: `docker run --env-file` keeps an inline comment as part of the value. Leave `SLACK_APP_TOKEN` commented out unless you use Socket Mode, since setting it switches the app to Socket Mode.
 
-In the ManageLM portal, go to **Settings > Webhooks** and create a webhook pointing to `https://<your-host>:3100/webhook` with the same secret.
+### 4. Register webhook
 
-### 4. Run
+An admin, in the ManageLM portal, goes to **Settings > MCP & API > Webhooks** and creates a webhook pointing to `https://<your-host>:3100/webhook`, with the event categories to post and the same secret.
+
+### 5. Run
 
 ```bash
-npm install && npm run build && npm start
+npm install && npm run build
+node --env-file=.env dist/app.js
 ```
+
+`npm start` does not read `.env`: use the command above (Node.js 20.6+), or export the variables yourself.
 
 Or with Docker:
 
@@ -83,35 +99,65 @@ docker build -t managelm-slack .
 docker run --env-file .env -p 3100:3100 managelm-slack
 ```
 
+In Socket Mode (`SLACK_APP_TOKEN` set, Socket Mode enabled in the Slack app), Slack events arrive over the socket; `/webhook` and `/health` still listen on `PORT`.
+
 ## Slash Commands
 
 | Command | Description |
 |---------|-------------|
-| `/managelm status` | List all agents with online/offline status |
-| `/managelm approve <hostname>` | Approve a pending agent |
+| `/managelm status` | List all agents with their status |
 | `/managelm run` | Open a modal to pick server, skill, and instruction |
-| `/managelm run <host> <skill> <text>` | Run a task inline |
+| `/managelm run <host> <skill> <text>` | Run a task inline (`auto` lets the agent pick the skill) |
+| `/managelm task <task_id>` | Show a task's status and result |
+| `/managelm answer <task_id> <answer>` | Answer a task waiting for input (replies are private) |
+| `/managelm scan <host> <security\|inventory\|access\|certificates\|activity>` | Start a scan |
+| `/managelm search <kind> [text]` | Search agents, inventory, security, activity, monitors, backups, certificates, pki, credentials |
 | `/managelm help` | Show available commands |
+
+Hosts are named by their exact hostname or display name (not case-sensitive). A partial name is never used as a target; the bot lists the hosts it could mean instead.
+
+A task still running after 100 seconds is reported as such, with the command to check it later. Results of the run form go to the info channel (or the alerts channel), or to you as a direct message from the app when neither is set. Approving agents and other portal settings are done in the portal.
 
 ## Event Notifications
 
-| Event | Notification |
-|-------|--------------|
-| `agent.enrolled` | Enrollment request with **Approve** button |
-| `agent.approved` | Confirmation that the agent is managed |
-| `agent.online` | Agent connected to the portal |
-| `agent.offline` | Agent disconnected (routed to alerts channel) |
-| `task.completed` | Task summary with **View Details** button |
-| `task.failed` | Error with **View Details** button (routed to alerts) |
+| Category | Events |
+|----------|--------|
+| Agent | `agent.enrolled` (with a **Review in Portal** link), `agent.approved`, `agent.online`, `agent.offline` |
+| Task | `task.completed`, `task.failed`, `task.needs_input` (with **View Details**) |
+| Report | `report.completed`, `report.failed`, `report.stalled` |
+| Monitor | `monitor.down`, `monitor.up`, `monitor.stalled`, `monitor.created`, `monitor.deleted` |
+| Backup | `backup.completed`, `backup.failed` |
+| Certificate | `cert.issued`, `cert.renewed`, `cert.renewal_failed`, `cert.revoked`, `cert.reactivated`, `cert.deleted` |
+| Credential | `credential.rotated`, `credential.rotation_failed` |
+| Keystore | `keystore.access_denied`, `keystore.key_deleted` |
+| Pentest | `pentest.completed`, `pentest.failed` |
+| Sessions | `console.opened`, `console.closed`, `desktop.opened`, `desktop.closed`, `files.opened` |
 
 ## Channel Routing
 
-Route critical events to a dedicated alerts channel:
+Route warnings and critical events (the ones the portal itself flags: agent offline, task failed, monitor down, backup or rotation failed, certificate renewal failed, keystore refusals, admin sessions opened, ...) to a dedicated alerts channel:
 
 ```bash
-SLACK_CHANNEL_ALERTS=C0123456789    # agent.offline, task.failed
-SLACK_CHANNEL_INFO=C9876543210      # all other events
+# Warnings and critical events
+SLACK_CHANNEL_ALERTS=C0123456789
+# All other events
+SLACK_CHANNEL_INFO=C9876543210
 ```
+
+With only one set, every event goes there. Invite the app to these channels so it can post.
+
+## Access Control
+
+The bot runs everything with the API key's access. Without the two settings below, anyone in the Slack workspace can use `/managelm` — run tasks, answer them, start scans, search — with the rights of the key's owner.
+
+```bash
+# Slack user IDs allowed to use the bot
+SLACK_ALLOWED_USERS=U0123456789,U0987654321
+# Channel IDs where commands, the run form and buttons are accepted
+SLACK_ALLOWED_CHANNELS=C0123456789,C9876543210
+```
+
+When a list is set, slash commands, run form submissions and buttons from a user or channel outside it are refused. With both set, both must match. Add the alert channels to `SLACK_ALLOWED_CHANNELS` for their **View Details** buttons to work.
 
 ## Security Audits
 
@@ -119,11 +165,11 @@ SLACK_CHANNEL_INFO=C9876543210      # all other events
   <img src="assets/security-audit.png" alt="ManageLM Security Audit — vulnerability findings with severity levels" width="700">
 </p>
 
-Run security audits from Slack and get findings delivered to your channel with severity levels and remediation steps.
+Start security audits with `/managelm scan <host> security`, get the report event in your channel, and list findings with `/managelm search security`.
 
 ## Requirements
 
-- **Node.js 20+**
+- **Node.js 20.6+**
 - **ManageLM account** — [sign up free](https://app.managelm.com/register) (up to 10 agents)
 - **Slack workspace** with permission to install apps
 

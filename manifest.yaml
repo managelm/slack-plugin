@@ -6,16 +6,17 @@
 
 display_information:
   name: ManageLM
-  description: Manage Linux servers — get alerts, run tasks, and approve agents from Slack.
+  description: Manage Linux and Windows servers — get alerts, run tasks, scans and searches from Slack.
   long_description: |
-    ManageLM brings your Linux server management into Slack. Receive real-time
-    notifications when agents come online or go offline, when tasks complete or
-    fail, and approve new servers — all without leaving your workspace.
+    ManageLM brings your server management into Slack. Receive real-time
+    notifications for agents, tasks, scans, monitors, backups, certificates,
+    credentials and admin sessions, and run tasks, scans and fleet searches,
+    all without leaving your workspace.
 
     Features:
-    - Real-time alerts for agent and task events
-    - /managelm slash command for status, approve, and running tasks
-    - Interactive buttons to approve agents and view task details
+    - Real-time alerts for every ManageLM event
+    - /managelm slash command: status, run, task, answer, scan, search
+    - Interactive buttons to view task details
     - Channel routing for alerts vs informational events
 
     Requires a ManageLM account and API key. Learn more at https://www.managelm.com
@@ -25,10 +26,18 @@ features:
   bot_user:
     display_name: ManageLM
     always_online: true
+  app_home:
+    # Run form results reach the user as a direct message from the app when
+    # no channel is configured; read-only, the app does not handle replies.
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: true
   slash_commands:
     - command: /managelm
-      description: Manage Linux servers with ManageLM
-      usage_hint: "status | approve <host> | run <host> <skill> <task> | help"
+      # Replace <YOUR_HOST> with your plugin's public URL
+      url: https://<YOUR_HOST>/slack/events
+      description: Manage your servers with ManageLM
+      usage_hint: "status | run <host> <skill> <task> | task <id> | answer <id> <text> | scan <host> <type> | search <kind> [text] | help"
       should_escape: false
 
 oauth_config:
