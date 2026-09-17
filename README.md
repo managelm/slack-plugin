@@ -81,7 +81,7 @@ Keep every comment on its own line: `docker run --env-file` keeps an inline comm
 
 ### 4. Register webhook
 
-An admin, in the ManageLM portal, goes to **Settings > MCP & API > Webhooks** and creates a webhook pointing to `https://<your-host>:3100/webhook`, with the event categories to post and the same secret.
+An admin, in the ManageLM portal, goes to **Settings > MCP & API > Webhooks** and creates a webhook pointing to the plugin's `/webhook`, with the event categories to post and the same secret. The plugin serves plain HTTP on `PORT`: use the HTTPS URL of the TLS reverse proxy in front of it (for example `https://slack-bot.example.com/webhook`), or `http://<your-host>:3100/webhook` only when the portal reaches the plugin over a private network.
 
 ### 5. Run
 
@@ -114,9 +114,9 @@ In Socket Mode (`SLACK_APP_TOKEN` set, Socket Mode enabled in the Slack app), Sl
 | `/managelm search <kind> [text]` | Search agents, inventory, security, activity, monitors, backups, certificates, pki, credentials |
 | `/managelm help` | Show available commands |
 
-Hosts are named by their exact hostname or display name (not case-sensitive). A partial name is never used as a target; the bot lists the hosts it could mean instead.
+Hosts are named by their exact hostname or display name (not case-sensitive). A partial name is never used as a target; the bot lists the hosts it could mean instead. A name with spaces, or one shared by several servers, is picked in the run form.
 
-A task still running after 100 seconds is reported as such, with the command to check it later. Results of the run form go to the info channel (or the alerts channel), or to you as a direct message from the app when neither is set. Approving agents and other portal settings are done in the portal.
+A task still running after 100 seconds is reported as such, with the command to check it later. Results of the run form go to the info channel (or the alerts channel), or to you as a direct message from the app when neither is set or the app cannot post there. When the bot gets no confirmation for an answer (timeout, portal or proxy error), it may still have been delivered: check with `/managelm task <task_id>`. Approving agents and other portal settings are done in the portal.
 
 ## Event Notifications
 
@@ -157,7 +157,13 @@ SLACK_ALLOWED_USERS=U0123456789,U0987654321
 SLACK_ALLOWED_CHANNELS=C0123456789,C9876543210
 ```
 
-When a list is set, slash commands, run form submissions and buttons from a user or channel outside it are refused. With both set, both must match. Add the alert channels to `SLACK_ALLOWED_CHANNELS` for their **View Details** buttons to work.
+When a list is set, slash commands, run form submissions and buttons from a user or channel outside it are refused. With both set, both must match.
+
+The **View Details** button on task notifications is checked like a command, against both lists: add the channels that receive notifications to `SLACK_ALLOWED_CHANNELS` for it to work there. Allowing a channel lets everyone in it use `/managelm` too, unless `SLACK_ALLOWED_USERS` narrows who.
+
+## Troubleshooting
+
+**Deliveries refused, then the webhook disabled.** Each delivery carries its send time, and the plugin refuses one more than 5 minutes away from its own clock (the webhook shows **Last: 401** in the portal, and the plugin answers `Missing or expired timestamp`). The portal counts every refusal as a failed delivery and disables the webhook after repeated failures, so keep this host's clock synchronized (NTP), then re-enable the webhook in the portal. A delivery received twice is answered but posted once.
 
 ## Security Audits
 

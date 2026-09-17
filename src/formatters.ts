@@ -48,10 +48,21 @@ export const STATUS_ICONS: Record<string, string> = {
  * `<!channel>` pings a whole channel and `<https://x|label>` disguises a link.
  * Everything that comes from an agent, the LLM, the portal or a typed command
  * goes through here before it lands in a message; the formatting this plugin
- * adds itself (*bold*, `code`, <!date^…>) stays outside it.
+ * adds itself (*bold*, `code`, <!date^…>) stays outside it. A literal < or >
+ * the plugin writes (a placeholder like &lt;host&gt;) is written escaped.
  */
 export function esc(value: unknown): string {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * The reverse of esc(), for text Slack sends: it escapes &, < and > in slash
+ * command text. One pass, so a typed "&amp;lt;" comes back as "&lt;", not "<".
+ * Decode before using the text (instruction, answer, host name, search), then
+ * esc() again only where it is displayed.
+ */
+export function unesc(text: string): string {
+  return text.replace(/&(amp|lt|gt);/g, (_, name: string) => (name === 'amp' ? '&' : name === 'lt' ? '<' : '>'));
 }
 
 /** A copy of `row` with its top-level string values escaped (see esc). */
@@ -245,7 +256,8 @@ function taskEvent(event: string, data: Record<string, unknown>, ts: string): Fo
     detail += `\n*Error:* ${(data.error_message || 'Unknown error') as string}`;
   } else {
     detail += `\n*Question:* ${(data.question || 'The agent needs more information.') as string}`;
-    detail += `\n_Answer with_ \`/managelm answer ${taskId} <your answer>\``;
+    // The placeholder is escaped too: Slack would read <your answer> as a link.
+    detail += `\n_Answer with_ \`/managelm answer ${taskId} &lt;your answer&gt;\``;
   }
 
   return {
@@ -297,7 +309,8 @@ function genericEvent(event: string, data: Record<string, unknown>, ts: string):
  * interpolate `data` as is and must not escape it again.
  */
 export function formatWebhookEvent(payload: WebhookPayload): FormattedMessage | null {
-  if (!EVENTS[payload.event]) return null;
+  // Own keys only: "constructor" is not an event.
+  if (!Object.hasOwn(EVENTS, payload.event)) return null;
   const data = escapeStrings(payload.data);
   if (payload.event.startsWith('agent.')) return agentEvent(payload.event, data, payload.timestamp);
   if (payload.event.startsWith('task.')) return taskEvent(payload.event, data, payload.timestamp);

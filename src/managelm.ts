@@ -75,6 +75,16 @@ class ApiError extends Error {
   }
 }
 
+/**
+ * True when the portal refused a request (HTTP 4xx): validation, permissions,
+ * an unknown ID or a wrong state, all checked before it acts. A timeout, a
+ * network error or a 5xx (portal or proxy) says nothing about whether the
+ * request took effect.
+ */
+export function isRefusal(err: unknown): boolean {
+  return err instanceof ApiError && err.statusCode >= 400 && err.statusCode < 500;
+}
+
 async function api<T = unknown>(
   method: string,
   endpoint: string,
@@ -146,8 +156,8 @@ export async function listAgents(): Promise<Agent[]> {
  * joins and returns every agent's metrics and settings, which on a large fleet
  * is megabytes for a dropdown or a name lookup.
  */
-export async function listAgentSummaries(): Promise<AgentSummary[]> {
-  const data = await api<{ agents: AgentSummary[] }>('GET', '/agents?view=basic');
+export async function listAgentSummaries(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<AgentSummary[]> {
+  const data = await api<{ agents: AgentSummary[] }>('GET', '/agents?view=basic', undefined, timeoutMs);
   return data.agents;
 }
 
@@ -182,8 +192,8 @@ export async function findAgentByHostname(name: string): Promise<{ agent: AgentS
 // ─── Skills ──────────────────────────────────────────────────────────
 
 /** Skills in the account, one entry per slug (Linux and Windows share one). */
-export async function listSkills(): Promise<Skill[]> {
-  const data = await api<{ skills: Skill[] }>('GET', '/skills');
+export async function listSkills(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Skill[]> {
+  const data = await api<{ skills: Skill[] }>('GET', '/skills', undefined, timeoutMs);
   const bySlug = new Map<string, Skill>();
   for (const s of data.skills) if (!bySlug.has(s.slug)) bySlug.set(s.slug, s);
   return [...bySlug.values()].sort((a, b) => a.name.localeCompare(b.name));

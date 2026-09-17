@@ -40,11 +40,40 @@ if (config.allowedUsers.length === 0 && config.allowedChannels.length === 0) {
 const MAX_BODY = 512 * 1024;
 
 /**
- * How far a delivery's `timestamp` may sit from this clock, either way. The
- * portal resends the same body within ~15 s when a delivery fails; a body
- * older than this is a replay, not a retry.
+ * How far a delivery's `timestamp` may sit from this clock, either way. When a
+ * delivery fails the portal sends the same body again: up to 3 attempts, 10 s
+ * timeout each, ~2 s then ~4 s apart, so all within about 40 s. A body older
+ * than this is a replay, not a retry. Refusals count as delivery failures on
+ * the portal, which disables the webhook after repeated ones: this host's
+ * clock must be synchronized.
  */
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * Signatures of the deliveries accepted in the last REPLAY_WINDOW_MS, with
+ * when they arrived, oldest first (Map keeps insertion order). A signed, fresh
+ * body seen again — a replay, or the portal resending one whose 200 it did not
+ * receive — is answered 200 without posting it twice. Per process: one plugin
+ * instance serves one webhook.
+ */
+const seenDeliveries = new Map<string, number>();
+
+/** Most signatures kept; past it the oldest is forgotten (far above real traffic). */
+const MAX_SEEN_DELIVERIES = 10_000;
+
+/** Record a delivery's signature; true when it was already seen inside the window. */
+function isRepeat(signature: string, now = Date.now()): boolean {
+  for (const [seen, at] of seenDeliveries) {
+    if (now - at <= REPLAY_WINDOW_MS) break;   // the rest are newer
+    seenDeliveries.delete(seen);
+  }
+  if (seenDeliveries.has(signature)) return true;
+  if (seenDeliveries.size >= MAX_SEEN_DELIVERIES) {
+    seenDeliveries.delete(seenDeliveries.keys().next().value as string);
+  }
+  seenDeliveries.set(signature, now);
+  return false;
+}
 
 /**
  * Check X-Webhook-Signature: hex HMAC-SHA256 of the raw body. Compared as
@@ -170,12 +199,20 @@ function handleWebhookBody(req: IncomingMessage, res: ServerResponse, body: Buff
     return;
   }
 
+  // Signed and fresh, but already posted: say yes (a portal resend must not
+  // count as a failure) and post nothing. The HMAC is a function of the body,
+  // so the signature identifies the delivery.
+  if (isRepeat(signature)) {
+    console.warn(`[webhook] Repeated delivery ignored: ${payload.event}`);
+    reply(res, 200, { ok: true, duplicate: true });
+    return;
+  }
+
   console.log(`[webhook] Received event: ${payload.event}`);
 
   // Answer before posting. Posting can take long — the Slack client waits out
   // rate limits — and the portal gives up on a delivery after 10 s and sends
-  // it again, which would duplicate the message and count as a failure toward
-  // disabling the webhook.
+  // it again, which would count as a failure toward disabling the webhook.
   reply(res, 200, { ok: true });
 
   const fallbackChannel = config.channelAlerts || config.channelInfo || '';

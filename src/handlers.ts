@@ -24,14 +24,17 @@
  * whoever reaches the bot.
  *
  * Text from agents, the LLM, the portal or the typed command is escaped with
- * esc() where it is placed in a message; the caller passes raw values.
+ * esc() where it is placed in a message; the caller passes raw values. Slack
+ * sends command text with &, < and > already escaped, so the command handler
+ * decodes it (unesc) once, before anything reads it. Placeholders the plugin
+ * writes itself (&lt;host&gt;) are written escaped.
  */
 
 import type { App, SlackCommandMiddlewareArgs, BlockAction, ButtonAction } from '@slack/bolt';
 import type { WebClient } from '@slack/web-api';
 import * as mlm from './managelm.js';
 import { config, isAllowed } from './config.js';
-import { STATUS_ICONS, esc, escapeStrings, truncate } from './formatters.js';
+import { STATUS_ICONS, esc, escapeStrings, truncate, unesc } from './formatters.js';
 
 /** Reply to someone outside SLACK_ALLOWED_USERS / SLACK_ALLOWED_CHANNELS. */
 const NOT_ALLOWED = 'You are not allowed to use ManageLM here.';
@@ -56,7 +59,9 @@ export function registerCommands(app: App): void {
       return;
     }
 
-    const args = command.text.trim().split(/\s+/).filter(Boolean);
+    // Decoded once here: every handler reads the text as the user typed it.
+    const text = unesc(command.text);
+    const args = text.trim().split(/\s+/).filter(Boolean);
     const subcommand = (args[0] || 'help').toLowerCase();
 
     try {
@@ -67,22 +72,22 @@ export function registerCommands(app: App): void {
         case 'run':
           // No args → open modal; with args → inline execution
           if (args.length < 4) {
-            await openRunModal(client, command.trigger_id, command.channel_id);
+            await openRunModal(client, command.trigger_id, command.channel_id, respond);
           } else {
-            await handleRun(args.slice(1), respond);
+            await handleRun(args.slice(1), textAfterWords(text, 3).trim(), respond);
           }
           break;
         case 'task':
           await handleTask(args.slice(1), respond);
           break;
         case 'answer':
-          await handleAnswer(args.slice(1), respond);
+          await handleAnswer(args[1], textAfterWords(text, 2), respond);
           break;
         case 'scan':
           await handleScan(args.slice(1), respond);
           break;
         case 'search':
-          await handleSearch(args.slice(1), respond);
+          await handleSearch(args[1], textAfterWords(text, 2).trim(), respond);
           break;
         case 'help':
         default:
@@ -101,6 +106,22 @@ function errorMessage(err: unknown, fallback: string): string {
   return err instanceof Error ? err.message : fallback;
 }
 
+/** The Web API error code of a failed Slack call (not_in_channel, expired_trigger_id, ...). */
+function slackErrorCode(err: unknown): string | undefined {
+  return (err as { data?: { error?: string } } | null)?.data?.error;
+}
+
+/**
+ * The raw text after the first `count` words of a command, without the
+ * whitespace that separates it from them. Inner spaces, tabs and line breaks
+ * are kept: an answer can be a password, an instruction several lines.
+ * Empty when nothing follows those words.
+ */
+function textAfterWords(text: string, count: number): string {
+  const words = new RegExp(`^\\s*(?:\\S+\\s+){${count}}`).exec(text);
+  return words ? text.slice(words[0].length) : '';
+}
+
 /** Result text for a task that finished, paused, or is still running. */
 function outcomeText(outcome: mlm.TaskOutcome, agentName: string, skill: string): string {
   const where = `on \`${esc(agentName)}\`\n*Skill:* ${esc(skill)}`;
@@ -111,7 +132,7 @@ function outcomeText(outcome: mlm.TaskOutcome, agentName: string, skill: string)
   const task = outcome.task;
   if (task.status === 'needs_input') {
     return `:question: *Input needed* ${where}\n*Question:* ${esc(task.question || 'The agent needs more information.')}\n`
-      + `_Answer with_ \`/managelm answer ${esc(task.id)} <your answer>\``;
+      + `_Answer with_ \`/managelm answer ${esc(task.id)} &lt;your answer&gt;\``;
   }
   const icon = STATUS_ICONS[task.status] || ':grey_question:';
   const summary = task.summary || task.error_message || 'No output';
@@ -119,9 +140,24 @@ function outcomeText(outcome: mlm.TaskOutcome, agentName: string, skill: string)
 }
 
 /**
+ * How each candidate host reads in a "did you mean": its hostname first (what
+ * can be typed; a display name may hold spaces), the display name beside it
+ * when it differs, and the short agent ID when two hosts would still read the
+ * same — otherwise the list shows one name twice with no way to tell them apart.
+ */
+function hostChoices(agents: mlm.AgentSummary[]): string[] {
+  const label = (a: mlm.AgentSummary) => `\`${esc(a.hostname)}\``
+    + (a.display_name && a.display_name.toLowerCase() !== a.hostname.toLowerCase() ? ` (${esc(a.display_name)})` : '');
+  const count = new Map<string, number>();
+  for (const a of agents) count.set(label(a).toLowerCase(), (count.get(label(a).toLowerCase()) ?? 0) + 1);
+  return agents.map(a => ((count.get(label(a).toLowerCase()) ?? 0) > 1 ? `${label(a)} · ID ${esc(a.id.slice(0, 8))}` : label(a)));
+}
+
+/**
  * Resolve the host a command names (see mlm.findAgentByHostname), or reply why
- * it cannot and return null. Suggestions show the display name with the
- * hostname beside it, so a name shared by two hosts can still be told apart.
+ * it cannot and return null. When several hosts answer to the name exactly,
+ * the reply points to the exact hostname, or to the run form, which lists
+ * servers to pick from (the only way when the hostnames are the same too).
  */
 async function resolveHost(name: string, respond: Respond): Promise<mlm.AgentSummary | null> {
   const { agent, candidates } = await mlm.findAgentByHostname(name);
@@ -131,13 +167,17 @@ async function resolveHost(name: string, respond: Respond): Promise<mlm.AgentSum
     await respond({ response_type: 'ephemeral', text: `:x: No agent found matching \`${esc(name)}\`` });
     return null;
   }
-  const suggestions = candidates.slice(0, 5).map(a =>
-    `\`${esc(hostLabel(a))}\`${a.display_name && a.display_name !== a.hostname ? ` (${esc(a.hostname)})` : ''}`,
-  );
-  const more = candidates.length > 5 ? `, and ${candidates.length - 5} more` : '';
+  const choices = hostChoices(candidates);
+  const more = choices.length > 5 ? `, and ${choices.length - 5} more` : '';
+  // Candidates are the exact matches when there are several (see findAgentByHostname).
+  const wanted = name.toLowerCase();
+  const shared = candidates.some(a => a.hostname.toLowerCase() === wanted || a.display_name?.toLowerCase() === wanted);
+  const hint = shared
+    ? '\n_Several servers answer to that name: use the exact hostname, or pick the server in the run form (`/managelm run`)._'
+    : '';
   await respond({
     response_type: 'ephemeral',
-    text: `:x: \`${esc(name)}\` does not name a single agent. Did you mean ${suggestions.join(', ')}${more}?`,
+    text: `:x: \`${esc(name)}\` does not name a single agent. Did you mean ${choices.slice(0, 5).join(', ')}${more}?${hint}`,
   });
   return null;
 }
@@ -167,10 +207,9 @@ async function handleStatus(respond: Respond): Promise<void> {
   await respond({ response_type: 'in_channel', blocks: [section(summary)] });
 }
 
-/** /managelm run <hostname> <skill> <instruction...> — inline task submit. */
-async function handleRun(args: string[], respond: Respond): Promise<void> {
-  const [hostname, skill, ...rest] = args;
-  const instruction = rest.join(' ');
+/** /managelm run <hostname> <skill> <instruction...> — inline task submit; `instruction` is the text as typed. */
+async function handleRun(args: string[], instruction: string, respond: Respond): Promise<void> {
+  const [hostname, skill] = args;
 
   const agent = await resolveHost(hostname, respond);
   if (!agent) return;
@@ -202,18 +241,20 @@ async function handleRun(args: string[], respond: Respond): Promise<void> {
 async function handleTask(args: string[], respond: Respond): Promise<void> {
   const taskId = args[0];
   if (!taskId || !TASK_ID.test(taskId)) {
-    await respond({ response_type: 'ephemeral', text: 'Usage: `/managelm task <task_id>` (the task ID is a UUID)' });
+    await respond({ response_type: 'ephemeral', text: 'Usage: `/managelm task &lt;task_id&gt;` (the task ID is a UUID)' });
     return;
   }
   await respond({ response_type: 'ephemeral', blocks: await taskDetailBlocks(taskId) });
 }
 
-/** /managelm answer <task_id> <answer...> — answer a task waiting for input. */
-async function handleAnswer(args: string[], respond: Respond): Promise<void> {
-  const [taskId, ...rest] = args;
-  const answer = rest.join(' ');
+/**
+ * /managelm answer <task_id> <answer...> — answer a task waiting for input.
+ * `answer` is the raw text after the task ID: inner spaces and tabs are part
+ * of it (it can be a password).
+ */
+async function handleAnswer(taskId: string | undefined, answer: string, respond: Respond): Promise<void> {
   if (!taskId || !TASK_ID.test(taskId) || !answer) {
-    await respond({ response_type: 'ephemeral', text: 'Usage: `/managelm answer <task_id> <your answer>` (the task ID is a UUID)' });
+    await respond({ response_type: 'ephemeral', text: 'Usage: `/managelm answer &lt;task_id&gt; &lt;your answer&gt;` (the task ID is a UUID)' });
     return;
   }
 
@@ -222,18 +263,34 @@ async function handleAnswer(args: string[], respond: Respond): Promise<void> {
   // the typed command — answer included — to the whole channel.
   await respond({ response_type: 'ephemeral', text: ':hourglass_flowing_sand: Sending the answer...' });
 
+  // Look the task up first. Nothing has been sent yet, so any failure here —
+  // whatever its kind — means the answer was not sent.
+  let original: mlm.Task;
+  let agentName: string;
+  try {
+    original = await mlm.getTask(taskId);
+    agentName = hostLabel(await mlm.getAgent(original.agent_id));
+  } catch (err: unknown) {
+    await respond({ response_type: 'ephemeral', replace_original: false, text: `:x: Answer not sent: ${esc(errorMessage(err, 'Unknown error'))}` });
+    return;
+  }
+
   // The portal waits for the resumed task before it replies (up to 100 s), so
-  // "Answer sent" is only said once that reply is in. Any failure before it —
-  // unknown task, not waiting for input, session expired — means nothing was
-  // sent, and the portal's own message says why.
+  // "Answer sent" is only said once that reply is in. A 4xx — not waiting for
+  // input, session expired, no access — is a refusal checked before anything
+  // is delivered. Anything else (timeout, network error, 5xx from the portal
+  // or a proxy) can come after the portal took the answer and resumed the
+  // task, so the reply must not claim it was not sent: the task's status tells.
   let text: string;
   try {
-    const original = await mlm.getTask(taskId);
-    const agent = await mlm.getAgent(original.agent_id);
     const outcome = await mlm.answerTask(taskId, answer);
-    text = `:white_check_mark: Answer sent.\n${outcomeText(outcome, hostLabel(agent), original.skill_slug)}`;
+    text = `:white_check_mark: Answer sent.\n${outcomeText(outcome, agentName, original.skill_slug)}`;
   } catch (err: unknown) {
-    text = `:x: Answer not sent: ${esc(errorMessage(err, 'Unknown error'))}`;
+    const message = esc(errorMessage(err, 'Unknown error'));
+    text = mlm.isRefusal(err)
+      ? `:x: Answer not sent: ${message}`
+      : `:warning: No confirmation from ManageLM (${message}). The answer may have been delivered: `
+        + `check with \`/managelm task ${esc(taskId)}\`.`;
   }
   await respond({ response_type: 'ephemeral', replace_original: false, text });
 }
@@ -243,7 +300,7 @@ async function handleScan(args: string[], respond: Respond): Promise<void> {
   const [hostname, type] = args;
   const types = Object.keys(mlm.SCAN_ROUTES);
   if (!hostname || !type || !types.includes(type.toLowerCase())) {
-    await respond({ response_type: 'ephemeral', text: `Usage: \`/managelm scan <hostname> <${types.join('|')}>\`` });
+    await respond({ response_type: 'ephemeral', text: `Usage: \`/managelm scan &lt;hostname&gt; &lt;${types.join('|')}&gt;\`` });
     return;
   }
 
@@ -316,28 +373,32 @@ const SEARCHES: Record<string, { route: string; rows: string; line: (r: Row) => 
   },
 };
 
-/** /managelm search <kind> [text] — search the fleet. */
-async function handleSearch(args: string[], respond: Respond): Promise<void> {
-  const [kindArg, ...rest] = args;
+/** /managelm search <kind> [text] — search the fleet; `text` is the search text as typed. */
+async function handleSearch(kindArg: string | undefined, text: string, respond: Respond): Promise<void> {
   const kind = (kindArg || '').toLowerCase();
-  const spec = SEARCHES[kind];
-  if (!spec) {
-    await respond({ response_type: 'ephemeral', text: `Usage: \`/managelm search <${Object.keys(SEARCHES).join('|')}> [text]\`` });
+  // Own keys only: SEARCHES['constructor'] is Object's, not a search.
+  if (!Object.hasOwn(SEARCHES, kind)) {
+    await respond({ response_type: 'ephemeral', text: `Usage: \`/managelm search &lt;${Object.keys(SEARCHES).join('|')}&gt; [text]\`` });
     return;
   }
+  const spec = SEARCHES[kind];
 
-  const data = await mlm.search(spec.route, { query: rest.join(' ') });
+  const data = await mlm.search(spec.route, { query: text });
   const rows = (data[spec.rows] as Row[] | undefined) || [];
   if (rows.length === 0) {
     await respond({ response_type: 'ephemeral', text: `No ${kind} found.` });
     return;
   }
 
+  // truncated: the portal capped the rows (monitors, backups, pki, credentials),
+  // so the count is a floor and the ones left out are not in the portal reply either.
+  const capped = data.truncated === true;
+  const count = capped ? `*${rows.length}+ ${kind}*, capped by ManageLM: refine the search` : `*${rows.length} ${kind}*`;
   const lines = rows.slice(0, SEARCH_LINES).map(r => spec.line(escapeStrings(r)));
-  const more = rows.length > SEARCH_LINES ? `\n_…and ${rows.length - SEARCH_LINES} more. Narrow the search or open the portal._` : '';
+  const more = rows.length > SEARCH_LINES ? `\n_…and ${rows.length - SEARCH_LINES}${capped ? '+' : ''} more. Narrow the search or open the portal._` : '';
   await respond({
     response_type: 'ephemeral',
-    blocks: [section(`*${rows.length} ${kind}*\n${lines.join('\n')}${more}`)],
+    blocks: [section(`${count}\n${lines.join('\n')}${more}`)],
   });
 }
 
@@ -354,14 +415,15 @@ async function handleHelp(respond: Respond): Promise<void> {
             '*ManageLM Slack Commands*',
             '',
             '`/managelm status` — List all agents with their status',
-            '`/managelm run` — Open task form (or inline: `/managelm run <host> <skill> <instruction>`)',
-            '`/managelm task <task_id>` — Show a task\'s status and result',
-            '`/managelm answer <task_id> <answer>` — Answer a task waiting for input',
-            `\`/managelm scan <host> <${Object.keys(mlm.SCAN_ROUTES).join('|')}>\` — Start a scan`,
-            `\`/managelm search <${Object.keys(SEARCHES).join('|')}> [text]\` — Search your fleet`,
+            '`/managelm run` — Open task form (or inline: `/managelm run &lt;host&gt; &lt;skill&gt; &lt;instruction&gt;`)',
+            '`/managelm task &lt;task_id&gt;` — Show a task\'s status and result',
+            '`/managelm answer &lt;task_id&gt; &lt;answer&gt;` — Answer a task waiting for input',
+            `\`/managelm scan &lt;host&gt; &lt;${Object.keys(mlm.SCAN_ROUTES).join('|')}&gt;\` — Start a scan`,
+            `\`/managelm search &lt;${Object.keys(SEARCHES).join('|')}&gt; [text]\` — Search your fleet`,
             '`/managelm help` — Show this help message',
             '',
-            `_Connected to ${config.portalPublicUrl}. Approving agents and other settings are done in the portal._`,
+            '_Name a host by its exact hostname or display name. A name with spaces cannot be typed: pick that server in the run form._',
+            `_Connected to ${esc(config.portalPublicUrl)}. Approving agents and other settings are done in the portal._`,
           ].join('\n'),
         },
       },
@@ -385,7 +447,7 @@ async function taskDetailBlocks(taskId: string) {
   if (task.error_message) fields.push(`*Error:* ${esc(task.error_message)}`);
   if (task.mutating) fields.push(':warning: _This task made changes_');
   if (task.completed_at) fields.push(`*Completed:* ${esc(task.completed_at)}`);
-  if (task.status === 'needs_input') fields.push(`_Answer with_ \`/managelm answer ${esc(task.id)} <your answer>\``);
+  if (task.status === 'needs_input') fields.push(`_Answer with_ \`/managelm answer ${esc(task.id)} &lt;your answer&gt;\``);
 
   return [section(`${status} *Task Details* (\`${esc(taskId)}\`)\n${fields.join('\n')}`)];
 }
@@ -402,31 +464,65 @@ const option = (text: string, value: string): Option => ({
 });
 
 /**
+ * How long the form waits for the portal. Slack's trigger_id expires 3 s after
+ * the command, and views.open itself needs part of that: a slower portal gets
+ * a clear reply rather than an expired form.
+ */
+const FORM_LOOKUP_TIMEOUT_MS = 2_000;
+
+/**
  * Open a modal for structured task submission. `channelId` is the channel the
  * command was typed in; it rides in private_metadata (set by the app, not
  * editable by the user) so the submission can be checked against
  * SLACK_ALLOWED_CHANNELS too.
+ *
+ * When the servers or skills cannot be listed, or no server is online, the
+ * user gets that as an ephemeral reply instead of a form that cannot be used.
  */
-async function openRunModal(client: WebClient, triggerId: string, channelId: string): Promise<void> {
-  // Online agents and the account's skills for the dropdowns, fetched together:
-  // Slack's trigger_id expires 3 s after the command. Slack caps a static select
-  // at 100 options.
-  const [agents, skills] = await Promise.allSettled([mlm.listAgentSummaries(), mlm.listSkills()]);
+async function openRunModal(client: WebClient, triggerId: string, channelId: string, respond: Respond): Promise<void> {
+  // Online agents and the account's skills for the dropdowns, fetched together
+  // within the trigger_id budget. Slack caps a static select at 100 options.
+  let agents: mlm.AgentSummary[];
+  let skills: mlm.Skill[];
+  try {
+    [agents, skills] = await Promise.all([
+      mlm.listAgentSummaries(FORM_LOOKUP_TIMEOUT_MS),
+      mlm.listSkills(FORM_LOOKUP_TIMEOUT_MS),
+    ]);
+  } catch (err: unknown) {
+    await respond({
+      response_type: 'ephemeral',
+      text: `:x: Could not load servers and skills from ManageLM: ${esc(errorMessage(err, 'Unknown error'))}`,
+    });
+    return;
+  }
 
-  let agentOptions: Option[] = agents.status === 'fulfilled'
-    ? agents.value.filter(a => a.status === 'online').slice(0, 100).map(a => option(hostLabel(a), a.id))
-    : [];
+  const agentOptions = agents.filter(a => a.status === 'online').slice(0, 100).map(a => option(hostLabel(a), a.id));
   if (agentOptions.length === 0) {
-    agentOptions = [option('No online agents', '_none_')];
+    await respond({ response_type: 'ephemeral', text: ':x: No online agents to run a task on.' });
+    return;
   }
 
-  // "Auto" first: the agent picks the skill from the instruction. Keep Auto
-  // only when the skills could not be listed.
-  const skillOptions: Option[] = [option('Auto (agent picks the skill)', 'auto')];
-  if (skills.status === 'fulfilled') {
-    skillOptions.push(...skills.value.slice(0, 99).map(s => option(s.name, s.slug)));
-  }
+  // "Auto" first: the agent picks the skill from the instruction.
+  const skillOptions: Option[] = [
+    option('Auto (agent picks the skill)', 'auto'),
+    ...skills.slice(0, 99).map(s => option(s.name, s.slug)),
+  ];
 
+  try {
+    await openRunView(client, triggerId, channelId, agentOptions, skillOptions);
+  } catch (err: unknown) {
+    if (slackErrorCode(err) !== 'expired_trigger_id') throw err;
+    await respond({
+      response_type: 'ephemeral',
+      text: ':x: ManageLM answered too slowly to open the form (Slack allows 3 seconds). Try again, or run the task inline: '
+        + '`/managelm run &lt;host&gt; &lt;skill&gt; &lt;instruction&gt;`',
+    });
+  }
+}
+
+/** The run form itself (see openRunModal). */
+async function openRunView(client: WebClient, triggerId: string, channelId: string, agentOptions: Option[], skillOptions: Option[]): Promise<void> {
   await client.views.open({
     trigger_id: triggerId,
     view: {
@@ -489,11 +585,6 @@ export function registerModals(app: App): void {
     const skill = view.state.values.skill_block.skill_select.selected_option?.value || '';
     const instruction = view.state.values.instruction_block.instruction_input.value || '';
 
-    if (agentId === '_none_') {
-      await ack({ response_action: 'errors', errors: { agent_block: 'No online agents available' } });
-      return;
-    }
-
     if (!agentId || !skill || !instruction) {
       await ack({ response_action: 'errors', errors: { instruction_block: 'All fields are required' } });
       return;
@@ -503,31 +594,41 @@ export function registerModals(app: App): void {
 
     // Progress and result go to the info or alerts channel; with neither
     // configured, to the submitting user as a direct message from the app.
-    const channel = config.channelInfo || config.channelAlerts || body.user.id;
+    const userId = body.user.id;
+    let channel = config.channelInfo || config.channelAlerts || userId;
 
+    /**
+     * Post to `channel`. When the configured channel refuses (app not invited,
+     * channel archived), this message and every later one go to the user by
+     * direct message instead, the first with a note saying why.
+     */
+    const post = async (text: string): Promise<void> => {
+      if (channel !== userId) {
+        try {
+          await client.chat.postMessage({ token: config.slackBotToken, channel, text });
+          return;
+        } catch (err: unknown) {
+          const reason = slackErrorCode(err) || errorMessage(err, 'unknown error');
+          console.warn(`[slack] Run form: cannot post to ${channel} (${reason}); sending to the user instead`);
+          text = `:warning: _Could not post to the configured channel (${esc(reason)}), so this comes to you directly._\n${text}`;
+          channel = userId;
+        }
+      }
+      await client.chat.postMessage({ token: config.slackBotToken, channel, text });
+    };
+    // A message that cannot be delivered anywhere is logged; it must not stop the task.
+    const undelivered = (err: unknown) => console.error('[slack] Run form: message not delivered:', err);
+
+    let text: string;
     try {
-      const agent = await mlm.getAgent(agentId);
-      const agentName = hostLabel(agent);
-
-      await client.chat.postMessage({
-        token: config.slackBotToken,
-        channel,
-        text: `:hourglass_flowing_sand: Running task on \`${esc(agentName)}\`...\n*Skill:* ${esc(skill)}\n*Instruction:* ${esc(instruction)}`,
-      });
-
-      const outcome = await mlm.runTask(agentId, skill, instruction);
-      await client.chat.postMessage({
-        token: config.slackBotToken,
-        channel,
-        text: outcomeText(outcome, agentName, skill),
-      });
+      const agentName = hostLabel(await mlm.getAgent(agentId));
+      await post(`:hourglass_flowing_sand: Running task on \`${esc(agentName)}\`...\n*Skill:* ${esc(skill)}\n*Instruction:* ${esc(instruction)}`)
+        .catch(undelivered);
+      text = outcomeText(await mlm.runTask(agentId, skill, instruction), agentName, skill);
     } catch (err: unknown) {
-      await client.chat.postMessage({
-        token: config.slackBotToken,
-        channel,
-        text: `:x: Task failed: ${esc(errorMessage(err, 'Task failed'))}`,
-      }).catch(() => {});
+      text = `:x: Task failed: ${esc(errorMessage(err, 'Task failed'))}`;
     }
+    await post(text).catch(undelivered);
   });
 }
 
