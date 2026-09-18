@@ -132,10 +132,11 @@ A task still running after 100 seconds is reported as such, with the command to 
 | Keystore | `keystore.access_denied`, `keystore.key_deleted` |
 | Pentest | `pentest.completed`, `pentest.failed` |
 | Sessions | `console.opened`, `console.closed`, `desktop.opened`, `desktop.closed`, `files.opened` |
+| Schedule | `schedule.report` (what each agent reported), `schedule.failed` |
 
 ## Channel Routing
 
-Route warnings and critical events (the ones the portal itself flags: agent offline, task failed, monitor down, backup or rotation failed, certificate renewal failed, keystore refusals, admin sessions opened, ...) to a dedicated alerts channel:
+Route warnings and critical events (the ones the portal itself flags: agent offline, task failed, monitor down, backup or rotation failed, certificate renewal failed, keystore refusals, admin sessions opened, schedule reports and failures, ...) to a dedicated alerts channel:
 
 ```bash
 # Warnings and critical events

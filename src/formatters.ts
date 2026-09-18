@@ -3,7 +3,7 @@
  *
  * Agent and task events have their own formatters (buttons to act on them).
  * Every other event — reports, monitors, backups, certificates, credentials,
- * keystore, pentests, admin sessions — goes through one table-driven formatter:
+ * keystore, pentests, admin sessions, schedules — goes through one table-driven formatter:
  * EVENTS says what the event is called, how urgent it is and which portal page
  * it links to, and the payload's known fields are listed below the title.
  */
@@ -75,6 +75,11 @@ export function escapeStrings<T extends Record<string, unknown>>(row: T): T {
 /** Slack refuses a section block over 3000 characters; stay under it. */
 const SECTION_TEXT_LIMIT = 2900;
 
+/** Agents' reports shown in a schedule.report message, and how much of each —
+ *  together they fit the section limit above. */
+const REPORTS_SHOWN = 3;
+const REPORT_CHARS = 800;
+
 /**
  * Cut mrkdwn text to fit a section block. The cut falls on a line break when
  * one is reasonably close, so it does not split an escape (&amp;) or a list line.
@@ -128,6 +133,10 @@ const EVENTS: Record<string, { title: string; icon: string; alert?: boolean; pag
   'desktop.opened':             { title: 'Desktop Session Opened',     icon: ':desktop_computer:',      page: '/audit-log', alert: true },
   'desktop.closed':             { title: 'Desktop Session Closed',     icon: ':desktop_computer:',      page: '/audit-log' },
   'files.opened':               { title: 'File Browser Opened',        icon: ':open_file_folder:',      page: '/audit-log', alert: true },
+  // A scheduled task's run: an agent found what the prompt asked it to report,
+  // or tasks failed. Both are 'warn' in the portal's notify defaults.
+  'schedule.report':            { title: 'Schedule Report',            icon: ':memo:',                  page: '/schedules', alert: true },
+  'schedule.failed':            { title: 'Schedule Failed',            icon: ':warning:',               page: '/schedules', alert: true },
 };
 
 /**
@@ -139,6 +148,9 @@ const FIELDS: Array<[key: string, label: string, format?: (v: unknown, d: Record
   ['backup_name', 'Backup'],
   ['common_name', 'Certificate'],
   ['credential_name', 'Credential'],
+  ['schedule_name', 'Schedule'],
+  // schedule.report: how many of the run's agents had something to report.
+  ['hosts_total', 'Reported', (v, d) => `${Array.isArray(d.reports) ? d.reports.length : 0} of ${v} agents`],
   ['username', 'Account'],
   // console / desktop / files sessions: who opened them.
   ['user_email', 'User'],
@@ -286,6 +298,24 @@ function genericEvent(event: string, data: Record<string, unknown>, ts: string):
   if (Array.isArray(names) && names.length > 0) {
     const shown = names.slice(0, 5).map(n => n.name).filter(Boolean).map(esc).join(', ');
     lines.push(`*Affected:* ${shown}${names.length > 5 ? `, and ${names.length - 5} more` : ''}`);
+  }
+  // A schedule run names its agents in nested lists, which escapeStrings() did
+  // not reach either: what each one reported (schedule.report), or why each
+  // failed (schedule.failed). Reports are the LLM's Markdown write-ups and can
+  // be long, so a few are shown, each cut before escaping (never mid-entity);
+  // the button opens the rest.
+  const reports = data.reports as Array<{ hostname?: string; report?: string }> | undefined;
+  if (Array.isArray(reports) && reports.length > 0) {
+    for (const r of reports.slice(0, REPORTS_SHOWN)) {
+      const text = String(r.report ?? '');
+      lines.push(`*${esc(r.hostname)}:*\n${esc(text.length > REPORT_CHARS ? `${text.slice(0, REPORT_CHARS)}…` : text)}`);
+    }
+    if (reports.length > REPORTS_SHOWN) lines.push(`_…and ${reports.length - REPORTS_SHOWN} more in the portal_`);
+  }
+  const failed = data.failed as Array<{ hostname?: string; status?: string; error?: string | null }> | undefined;
+  if (Array.isArray(failed) && failed.length > 0) {
+    const shown = failed.slice(0, 5).map(f => `${esc(f.hostname)} (${esc(f.error || f.status)})`).join(', ');
+    lines.push(`*Failed:* ${shown}${failed.length > 5 ? `, and ${failed.length - 5} more` : ''}`);
   }
 
   const heading = `${meta.icon} *${meta.title}*${host ? ` on \`${host}\`` : ''}`;
