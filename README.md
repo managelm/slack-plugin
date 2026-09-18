@@ -27,7 +27,7 @@ Get real-time alerts for everything that happens in ManageLM (agents, tasks, sca
 
 ## Features
 
-- **Real-time notifications** — every ManageLM event, with a **View in Portal** link
+- **Real-time notifications** — every ManageLM event, with a **View in Portal** link on all but agent approved / online
 - **Slash commands** — `status`, `run`, `task`, `answer`, `scan`, `search`, `help`
 - **Run task modal** — `/managelm run` opens a form to pick server, skill (or Auto), and instruction
 - **Answer from Slack** — reply to a task waiting for input with `/managelm answer`, privately
@@ -68,9 +68,14 @@ SLACK_SIGNING_SECRET=your-signing-secret
 # ManageLM
 MANAGELM_PORTAL_URL=https://app.managelm.com
 MANAGELM_API_KEY=mlm_ak_your-key
+# Base of the "View in Portal" links (default: MANAGELM_PORTAL_URL)
+MANAGELM_PORTAL_PUBLIC_URL=https://app.managelm.com
 
 # Webhook
 MANAGELM_WEBHOOK_SECRET=your-webhook-secret
+
+# HTTP port for /slack/events, /webhook and /health (default: 3100)
+PORT=3100
 
 # Who may use the bot (strongly recommended)
 SLACK_ALLOWED_USERS=U0123456789,U0987654321
@@ -81,9 +86,11 @@ Keep every comment on its own line: `docker run --env-file` keeps an inline comm
 
 ### 4. Register webhook
 
-An admin, in the ManageLM portal, goes to **Settings > MCP & API > Webhooks** and creates a webhook pointing to the plugin's `/webhook`, with the event categories to post and the same secret. The plugin serves plain HTTP on `PORT`: use the HTTPS URL of the TLS reverse proxy in front of it (for example `https://slack-bot.example.com/webhook`), or `http://<your-host>:3100/webhook` only when the portal reaches the plugin over a private network.
+An admin, in the ManageLM portal, goes to **Settings > MCP & API > Webhooks** and creates a webhook pointing to the plugin's `/webhook`, with the event categories to post and the same secret. The plugin serves plain HTTP on `PORT`: use the HTTPS URL of the TLS reverse proxy in front of it (for example `https://slack-bot.example.com/webhook`), or `http://<your-host>:3100/webhook` only when the portal reaches the plugin over a private network. A private address works with a self-hosted portal only (the SaaS portal refuses it), and `localhost` or any other loopback address is always refused.
 
 ### 5. Run
+
+From a clone of this repository:
 
 ```bash
 npm install && npm run build
@@ -92,12 +99,14 @@ node --env-file=.env dist/app.js
 
 `npm start` does not read `.env`: use the command above (Node.js 20.6+), or export the variables yourself.
 
-Or with Docker:
+Or with Docker, also from a clone:
 
 ```bash
 docker build -t managelm-slack .
 docker run --env-file .env -p 3100:3100 managelm-slack
 ```
+
+The release tarball holds the compiled app and its dependencies but not the sources, so `npm run build` and `docker build` do not work from it: run `node --env-file=.env dist/app.js` there directly.
 
 In Socket Mode (`SLACK_APP_TOKEN` set, Socket Mode enabled in the Slack app), Slack events arrive over the socket; `/webhook` and `/health` still listen on `PORT`.
 
@@ -123,7 +132,7 @@ A task still running after 100 seconds is reported as such, with the command to 
 | Category | Events |
 |----------|--------|
 | Agent | `agent.enrolled` (with a **Review in Portal** link), `agent.approved`, `agent.online`, `agent.offline` |
-| Task | `task.completed`, `task.failed`, `task.needs_input` (with **View Details**) |
+| Task | `task.completed`, `task.failed`, `task.needs_input`, each with **View Details** |
 | Report | `report.completed`, `report.failed`, `report.stalled` |
 | Monitor | `monitor.down`, `monitor.up`, `monitor.stalled`, `monitor.created`, `monitor.deleted` |
 | Backup | `backup.completed`, `backup.failed` |
