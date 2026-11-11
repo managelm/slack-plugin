@@ -325,50 +325,50 @@ const SEVERITY_ICONS: Record<string, string> = {
 };
 
 type Row = Record<string, any>;
-const host = (r: Row) => `\`${r.display_name || r.hostname || r.agent || r.server || '?'}\``;
+const host = (r: Row) => `\`${r.display_name || r.hostname || r.agent || '?'}\``;
 
 /**
- * Searches the command offers: route segment, key of the rows in the reply,
- * and how one row reads. Other searches stay available in the portal and to
- * MCP clients; these are the ones that read well as chat lines.
+ * Searches the command offers: route segment and how one row reads. Every
+ * search answers `{ rows, truncated }`. Other searches stay available in the
+ * portal and to MCP clients; these are the ones that read well as chat lines.
  *
  * `line` receives the row with its string values already escaped.
  */
-const SEARCHES: Record<string, { route: string; rows: string; line: (r: Row) => string }> = {
+const SEARCHES: Record<string, { route: string; line: (r: Row) => string }> = {
   agents: {
-    route: 'agents', rows: 'agents',
+    route: 'agents',
     line: r => `${STATUS_ICONS[r.status] || ':grey_question:'} ${host(r)} ${r.status}${r.os_info ? ` · ${r.os_info}` : ''}`,
   },
   inventory: {
-    route: 'inventory', rows: 'items',
+    route: 'inventory',
     line: r => `${host(r)} ${r.item_name}${r.item_version ? ` ${r.item_version}` : ''} (${r.item_category}, ${r.item_status})`,
   },
   security: {
-    route: 'security', rows: 'findings',
+    route: 'security',
     line: r => `${SEVERITY_ICONS[r.severity] || ':white_circle:'} ${host(r)} ${r.title}${r.source && r.source !== 'audit' ? ` _(${r.source})_` : ''}`,
   },
   activity: {
-    route: 'activity', rows: 'activity',
-    line: r => `${host(r)} ${String(r.category || '').replace('_', ' ')}: ${r.linux_user || r.managelm_user || ''} ${r.command || r.file || r.source_ip || ''} ${r.login_time || r.timestamp || ''}`.trim(),
+    route: 'activity',
+    line: r => `${host(r)} ${String(r.category || '').replace('_', ' ')}: ${r.system_user || r.managelm_user || ''} ${r.command || r.file || r.source_ip || ''} ${r.login_time || r.timestamp || ''}`.trim(),
   },
   monitors: {
-    route: 'monitors', rows: 'monitors',
+    route: 'monitors',
     line: r => `${r.status === 'up' ? ':large_green_circle:' : r.status === 'down' ? ':red_circle:' : ':large_yellow_circle:'} ${r.name} on ${host(r)} ${r.status}${r.value != null ? ` (${r.value} ${r.unit})` : ''}`,
   },
   backups: {
-    route: 'backups', rows: 'backups',
+    route: 'backups',
     line: r => `${r.status === 'ok' ? ':white_check_mark:' : r.status === 'failed' ? ':x:' : ':hourglass_flowing_sand:'} ${r.name} on ${host(r)} ${r.status}${r.error ? `: ${r.error}` : ''}`,
   },
   certificates: {
-    route: 'certs', rows: 'certs',
+    route: 'certs',
     line: r => `${r.expired ? ':red_circle:' : r.expiring_soon ? ':large_yellow_circle:' : ':white_circle:'} ${host(r)} ${r.subject} (${r.days_left ?? '?'} days)${r.self_signed ? ' self-signed' : ''}`,
   },
   pki: {
-    route: 'pki', rows: 'certificates',
+    route: 'pki',
     line: r => `${r.status === 'active' ? ':lock:' : ':warning:'} ${r.common_name} ${r.status}, expires ${r.expires || '?'}${r.agent ? ` on \`${r.agent}\`` : ''}`,
   },
   credentials: {
-    route: 'credentials', rows: 'credentials',
+    route: 'credentials',
     line: r => `${r.state === 'failed' ? ':x:' : ':key:'} ${r.name} (${r.account}) ${r.state}, next: ${r.next_rotation}`,
   },
 };
@@ -384,16 +384,16 @@ async function handleSearch(kindArg: string | undefined, text: string, respond: 
   const spec = SEARCHES[kind];
 
   const data = await mlm.search(spec.route, { query: text });
-  const rows = (data[spec.rows] as Row[] | undefined) || [];
+  const rows = (data.rows as Row[] | undefined) || [];
   if (rows.length === 0) {
     await respond({ response_type: 'ephemeral', text: `No ${kind} found.` });
     return;
   }
 
-  // truncated: the portal capped the rows (monitors, backups, pki, credentials),
-  // so the count is a floor and the ones left out are not in the portal reply either.
+  // truncated: more matched than the portal lists (one cap for every search),
+  // so the count is a floor and the ones left out are not in the reply either.
   const capped = data.truncated === true;
-  const count = capped ? `*${rows.length}+ ${kind}*, capped by ManageLM: refine the search` : `*${rows.length} ${kind}*`;
+  const count = capped ? `*${rows.length}+ ${kind}*, more results match: narrow the search` : `*${rows.length} ${kind}*`;
   const lines = rows.slice(0, SEARCH_LINES).map(r => spec.line(escapeStrings(r)));
   const more = rows.length > SEARCH_LINES ? `\n_…and ${rows.length - SEARCH_LINES}${capped ? '+' : ''} more. Narrow the search or open the portal._` : '';
   await respond({
