@@ -191,9 +191,9 @@ Start security audits with `/managelm scan <host> security`, get the report even
 
 ## Other Integrations
 
-- [Claude Code Extension](https://github.com/managelm/claude-extension) — MCP integration for Claude
+- [Claude Plugin](https://github.com/managelm/claude-plugin) — manage servers from claude.ai, Cowork and Claude Code
 - [VS Code Extension](https://github.com/managelm/vscode-extension) — `@managelm` in Copilot Chat
-- [ChatGPT Plugin](https://github.com/managelm/openai-gpt) — manage servers from ChatGPT
+- [ChatGPT Plugin](https://github.com/managelm/chatgpt-plugin) — manage servers from ChatGPT
 - [n8n Plugin](https://github.com/managelm/n8n-plugin) — infrastructure automation workflows
 - [OpenClaw Plugin](https://github.com/managelm/openclaw-plugin) — OpenClaw integration
 
